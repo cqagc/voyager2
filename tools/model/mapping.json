@@ -1,0 +1,23 @@
+{
+  "_comment": "人工映射骨架。先运行 analyze，再把 parts 中的示例键替换为实际 part_XXXX 或数字索引。不要修改 ComponentID。",
+  "_component_checklist": {
+    "Bus": null,
+    "HighGainAntenna": null,
+    "RTGBoom": null,
+    "RTG_1": null,
+    "RTG_2": null,
+    "RTG_3": null,
+    "MagnetometerBoom": null,
+    "ScienceBoom": null,
+    "ScanPlatform": null,
+    "Thrusters": null,
+    "Instrument_CRS": null,
+    "Instrument_LECP": null,
+    "Instrument_PLS": null,
+    "Instrument_MAG": null,
+    "Instrument_PWS": null
+  },
+  "parts": {
+    "_comment": "待人工填写。普通格式：\"part_0000\": \"Bus\"。Instrument_* 可用对象格式：\"part_0001\": {\"component\": \"Instrument_CRS\", \"parent\": \"ScanPlatform\"}。同一组件可由多个零件键指向。"
+  }
+}

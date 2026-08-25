@@ -1,0 +1,10 @@
+<!-- 人工构造的 Voyager 2 DSN 响应，仅用于解析和链路状态测试。 -->
+<dsn>
+	<station name="cdscc" friendlyName="Canberra" timeUTC="1787693239000" timeZoneOffset="36000000.0"/>
+	<dish name="DSS43" azimuthAngle="120.5" elevationAngle="31.2" windSpeed="2.5" isMSPA="false" isArray="false" isDDOR="false" activity="Spacecraft Telemetry, Tracking, and Command">
+		<upSignal active="true" signalType="data" dataRate="0" frequency="7150000000" band="X" power="18" spacecraft="VGR2" spacecraftID="-32"/>
+		<downSignal active="true" signalType="data" dataRate="160" frequency="8415000000" band="X" power="-158.5" spacecraft="VGR2" spacecraftID="-32"/>
+		<target name="VGR2" id="32" uplegRange="20490000000" downlegRange="20490000000" rtlt="136800"/>
+	</dish>
+	<timestamp>1787693239000</timestamp>
+</dsn>
