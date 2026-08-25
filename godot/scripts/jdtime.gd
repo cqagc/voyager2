@@ -60,3 +60,15 @@ static func sci(value: float, digits: int = 3) -> String:
 	var fmt := "%." + str(digits) + "f"
 	var out := (fmt % mant) + "e" + ("+" if exp >= 0 else "-") + "%02d" % absi(exp)
 	return ("-" if neg else "") + out
+
+## 时长的人类可读形式，按量级自适应单位。
+static func duration_text(sec: float) -> String:
+	if sec <= 0.0:
+		return "无数据"
+	if sec < 120.0:
+		return "%.1f 秒" % sec
+	if sec < 7200.0:
+		return "%.1f 分钟" % (sec / 60.0)
+	if sec < 172800.0:
+		return "%.2f 小时" % (sec / 3600.0)
+	return "%.2f 天" % (sec / 86400.0)

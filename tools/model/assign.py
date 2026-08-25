@@ -40,6 +40,7 @@ COMPONENTS = [
     "MagnetometerBoom", "ScienceBoom", "ScanPlatform", "Thrusters",
     "Instrument_CRS", "Instrument_LECP", "Instrument_PLS",
     "Instrument_MAG", "Instrument_PWS",
+    "GoldenRecord",
 ]
 
 # 该视觉模型**不区分**的组件 -> 实际承载它们几何的节点。
@@ -64,6 +65,7 @@ PARENTS = {
     "Instrument_LECP": "ScienceBoom",
     "Instrument_PLS": "ScienceBoom",
     "Instrument_PWS": "Bus",
+    "GoldenRecord": "Bus",
     "ScanPlatform": "ScienceBoom",
 }
 
@@ -76,7 +78,8 @@ COLORS = {
     "ScanPlatform": (0.05, 0.95, 0.85), "Thrusters": (1.0, 0.10, 0.85),
     "Instrument_CRS": (0.60, 0.20, 1.0), "Instrument_LECP": (0.35, 0.10, 0.75),
     "Instrument_PLS": (0.80, 0.55, 1.0), "Instrument_MAG": (0.55, 0.90, 1.0),
-    "Instrument_PWS": (0.95, 0.80, 0.35), "_EXCLUDED": (0.25, 0.25, 0.25),
+    "Instrument_PWS": (0.95, 0.80, 0.35), "GoldenRecord": (1.0, 0.78, 0.18),
+    "_EXCLUDED": (0.25, 0.25, 0.25),
 }
 
 # 磁强计桁架轴线：从桁架根部到实测末端。
@@ -104,6 +107,12 @@ def classify(centroid, size, materials):
     # brass 只用在两根 PRA/PWS 鞭状天线上，材质即身份，最可靠。
     if "brass" in materials:
         return "Instrument_PWS", "高：brass 材质专用于 PRA/PWS 鞭状天线"
+
+    # 金唱片：舱体外侧 X=+0.95 处的 0.314 m 圆盘。实物是 12 英寸（0.305 m）
+    # 镀金铜盘，尺寸吻合；而且这块的贴图就是真实的封面蚀刻图案（播放示意、
+    # 二进制时基、图像光栅、14 颗脉冲星定位图、氢原子超精细跃迁）。
+    if abs(x - 0.95) < 0.12 and abs(y) < 0.22 and abs(z) < 0.22 and max(size) < 0.40:
+        return "GoldenRecord", "高：舱体外侧 0.314 m 圆盘，与 12 英寸实物吻合，且贴图为真实封面蚀刻图案"
 
     d_boom = dist_to_segment(p, BOOM_ROOT, BOOM_TIP)
     d_tip = (p - BOOM_TIP).length

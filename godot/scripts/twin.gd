@@ -68,6 +68,31 @@ var btn_play: Button
 var btn_mode: Button
 var dsn_request: HTTPRequest
 var dsn_active_craft: Array = []
+
+# 右栏：测控几何 / 链路预算 / 轨道
+var lbl_tracking: RichTextLabel
+var lbl_link: RichTextLabel
+var lbl_orbit: RichTextLabel
+var spark_dist: Sparkline
+var spark_power: Sparkline
+var spark_rx: Sparkline
+
+# 金唱片
+var record_node: MeshInstance3D
+var record_orig_xform: Transform3D
+var record_spin_axis := Vector3.RIGHT
+var record_center := Vector3.ZERO
+var record_angle := 0.0
+var record_spinning := false
+var lbl_record: RichTextLabel
+var record_panel: PanelContainer
+var audio: AudioStreamPlayer
+var audio_queue: PackedVector2Array = PackedVector2Array()
+var audio_cursor := 0
+
+# 太阳系视图里的地球连线（DSN 链路那条线）
+var link_line: MeshInstance3D
+var craft_focus := Vector3.ZERO
 var _syncing_slider := false
 
 
@@ -90,6 +115,7 @@ func _ready() -> void:
 	_build_craft_view()
 	_build_ui()
 	_set_mode(ViewMode.SYSTEM)
+	_build_series()
 	_refresh()
 
 	if "--shots" in OS.get_cmdline_user_args():
@@ -175,6 +201,11 @@ func _build_system_view() -> void:
 	traveled_mesh.mesh = ImmediateMesh.new()
 	system_root.add_child(traveled_mesh)
 
+	# 探测器↔地球连线：这就是 DSN 上下行走的那条路径。
+	link_line = MeshInstance3D.new()
+	link_line.mesh = ImmediateMesh.new()
+	system_root.add_child(link_line)
+
 	probe_marker = MeshInstance3D.new()
 	var pm := SphereMesh.new()
 	pm.radius = 3.0
@@ -251,6 +282,19 @@ func _build_craft_view() -> void:
 
 	_index_components(craft_model)
 
+	if component_nodes.has("GoldenRecord"):
+		record_node = component_nodes["GoldenRecord"]
+		record_orig_xform = record_node.transform
+		var ab := record_node.get_aabb()
+		record_center = ab.position + ab.size * 0.5
+		# 唱片是个薄盘，最薄的那个轴就是它的法向，也就是自转轴。
+		var thin := 0
+		for i in 3:
+			if ab.size[i] < ab.size[thin]:
+				thin = i
+		record_spin_axis = Vector3.ZERO
+		record_spin_axis[thin] = 1.0
+
 	var key := DirectionalLight3D.new()
 	key.light_energy = 2.2
 	key.rotation_degrees = Vector3(-38, 145, 0)
@@ -287,7 +331,7 @@ func _build_ui() -> void:
 
 	# 左上：状态读数
 	var left := PanelContainer.new()
-	left.position = Vector2(16, 16)
+	left.position = Vector2(16, 12)
 	left.custom_minimum_size = Vector2(430, 0)
 	left.mouse_filter = Control.MOUSE_FILTER_STOP
 	ui.add_child(left)
@@ -313,19 +357,77 @@ func _build_ui() -> void:
 	btn_dsn.pressed.connect(_on_dsn_pressed)
 	vb.add_child(btn_dsn)
 
-	# 右上：组件面板
-	var right := PanelContainer.new()
-	right.set_anchors_preset(Control.PRESET_TOP_RIGHT)
-	right.position = Vector2(-470, 16)
-	right.custom_minimum_size = Vector2(450, 0)
-	right.mouse_filter = Control.MOUSE_FILTER_STOP
-	ui.add_child(right)
-	lbl_component = RichTextLabel.new()
-	lbl_component.bbcode_enabled = true
-	lbl_component.fit_content = true
-	lbl_component.custom_minimum_size = Vector2(430, 120)
-	lbl_component.scroll_active = false
-	right.add_child(lbl_component)
+	# 左栏底部：功率曲线
+	spark_power = Sparkline.new()
+	spark_power.custom_minimum_size = Vector2(410, 56)
+	spark_power.caption = "RTG 输出 1977 → 2035（模型推演）"
+	vb.add_child(spark_power)
+
+	spark_dist = Sparkline.new()
+	spark_dist.custom_minimum_size = Vector2(410, 56)
+	spark_dist.caption = "距地球距离 1977 → 2026"
+	spark_dist.line_color = Color(0.62, 0.86, 0.68)
+	spark_dist.fill_color = Color(0.35, 0.65, 0.45, 0.20)
+	vb.add_child(spark_dist)
+
+	# 右栏
+	var right_scroll := ScrollContainer.new()
+	right_scroll.set_anchors_preset(Control.PRESET_RIGHT_WIDE)
+	right_scroll.offset_left = -486
+	right_scroll.offset_top = 16
+	right_scroll.offset_right = -16
+	right_scroll.offset_bottom = -112
+	right_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	right_scroll.mouse_filter = Control.MOUSE_FILTER_STOP
+	ui.add_child(right_scroll)
+	var right_col := VBoxContainer.new()
+	right_col.custom_minimum_size = Vector2(455, 0)
+	right_col.add_theme_constant_override("separation", 6)
+	right_scroll.add_child(right_col)
+
+	lbl_tracking = _panel_label(right_col, 450)
+	lbl_link = _panel_label(right_col, 450)
+
+	spark_rx = Sparkline.new()
+	spark_rx.custom_minimum_size = Vector2(450, 52)
+	spark_rx.caption = "DSN 接收信号强度 dBm（自由空间路径损耗）"
+	spark_rx.line_color = Color(0.95, 0.72, 0.45)
+	spark_rx.fill_color = Color(0.75, 0.50, 0.25, 0.20)
+	right_col.add_child(spark_rx)
+
+	lbl_orbit = _panel_label(right_col, 450)
+	lbl_component = _panel_label(right_col, 450)
+
+	record_panel = PanelContainer.new()
+	record_panel.mouse_filter = Control.MOUSE_FILTER_STOP
+	record_panel.visible = false
+	right_col.add_child(record_panel)
+	var rv := VBoxContainer.new()
+	record_panel.add_child(rv)
+	var rscroll := ScrollContainer.new()
+	rscroll.custom_minimum_size = Vector2(450, 300)
+	rscroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	rv.add_child(rscroll)
+	lbl_record = RichTextLabel.new()
+	lbl_record.bbcode_enabled = true
+	lbl_record.fit_content = true
+	lbl_record.custom_minimum_size = Vector2(432, 0)
+	lbl_record.scroll_active = false
+	rscroll.add_child(lbl_record)
+	var rrow := HBoxContainer.new()
+	rv.add_child(rrow)
+	var b_tone := Button.new()
+	b_tone.text = "▶ 1000 Hz 校准音"
+	b_tone.pressed.connect(_play_calibration)
+	rrow.add_child(b_tone)
+	var b_scan := Button.new()
+	b_scan.text = "▶ 图像扫描线编码"
+	b_scan.pressed.connect(_play_scanlines)
+	rrow.add_child(b_scan)
+	var b_spin := Button.new()
+	b_spin.text = "⟳ 转起来"
+	b_spin.pressed.connect(func() -> void: record_spinning = not record_spinning)
+	rrow.add_child(b_spin)
 
 	# 底部：时间轴
 	var bottom := PanelContainer.new()
@@ -365,6 +467,19 @@ func _build_ui() -> void:
 		row.add_child(b)
 
 
+func _panel_label(parent: Node, width: int) -> RichTextLabel:
+	var pc := PanelContainer.new()
+	pc.mouse_filter = Control.MOUSE_FILTER_STOP
+	parent.add_child(pc)
+	var rt := RichTextLabel.new()
+	rt.bbcode_enabled = true
+	rt.fit_content = true
+	rt.custom_minimum_size = Vector2(width, 0)
+	rt.scroll_active = false
+	pc.add_child(rt)
+	return rt
+
+
 func _on_slider_changed(v: float) -> void:
 	if _syncing_slider:
 		return
@@ -394,7 +509,9 @@ func _set_mode(m: ViewMode) -> void:
 	system_root.visible = (m == ViewMode.SYSTEM)
 	craft_root.visible = (m == ViewMode.CRAFT)
 	if m == ViewMode.SYSTEM:
-		cam_dist = 2600.0
+		# 自动取景：按探测器当前距离取，免得一进场是一片空旷。
+		var d := JDTime.vec_len(eph.state_at("voyager2", jd_now)["pos"]) / eph.au_km * AU_UNITS
+		cam_dist = clampf(d * 1.5, 120.0, 6000.0)
 		btn_mode.text = "切到探测器特写"
 	else:
 		cam_dist = 34.0
@@ -405,6 +522,13 @@ func _set_mode(m: ViewMode) -> void:
 func _process(delta: float) -> void:
 	if fatal_error != "":
 		return
+	_pump_audio()
+	if record_spinning and record_node != null:
+		# 唱片实际转速 16⅔ rpm，这里按真实转速转，慢得有点催眠但是对的。
+		record_angle += delta * TAU * (16.6667 / 60.0)
+		var to_c := Transform3D(Basis(), record_center)
+		var rot := Transform3D(Basis(record_spin_axis, record_angle), Vector3.ZERO)
+		record_node.transform = record_orig_xform * to_c * rot * to_c.affine_inverse()
 	if playing:
 		jd_now += play_days_per_sec * delta
 		if jd_now >= jd_max:
@@ -419,6 +543,7 @@ func _process(delta: float) -> void:
 
 func _refresh() -> void:
 	var probe := eph.state_at("voyager2", jd_now)
+	var earth := eph.state_at("earth", jd_now)
 	var in_range: bool = probe["in_range"]
 
 	for name_str in planet_nodes:
@@ -428,18 +553,33 @@ func _refresh() -> void:
 
 	probe_marker.position = _to_units(probe["pos"])
 	probe_marker.visible = in_range
+	_scale_markers()
 	_rebuild_traveled()
+	_rebuild_link_line(probe, earth)
 	_update_camera()
 
-	var dist_km := JDTime.vec_len(probe["pos"])
+	var helio_km := JDTime.vec_len(probe["pos"])
 	var speed := JDTime.vec_len(probe["vel"])
 	var pw := eph.power_at(jd_now)
+	var trk := Geometry.tracking(probe, earth)
+	var link := Geometry.link_budget(float(trk["range_km"]))
+	var orb := Geometry.orbit(probe)
 
 	lbl_date.text = JDTime.format_date(jd_now)
+
+	# ---- 左栏：任务状态 ----
+	# 注意用的是**距地球**的光时，不是距太阳的。指令和遥测走的是地球这条线，
+	# 早先按距日算是错的（143 AU 时两者差约 1 AU，即 8 分多钟）。
 	var lines := PackedStringArray()
-	lines.append("[color=#8fa3bf]距日[/color]  %.2f AU   (%s km)" % [dist_km / eph.au_km, JDTime.sci(dist_km)])
-	lines.append("[color=#8fa3bf]日心速度[/color]  %.3f km/s" % speed)
-	lines.append("[color=#8fa3bf]单程光时[/color]  %s" % JDTime.light_time_text(dist_km))
+	lines.append("[color=#8fa3bf]距地球[/color]  %.3f AU   (%s km)" % [
+		float(trk["range_au"]), JDTime.sci(float(trk["range_km"]))])
+	lines.append("[color=#8fa3bf]距离变化率[/color]  %+.4f km/s   [color=#6f7f96]← DSN 的多普勒观测量[/color]"
+		% float(trk["range_rate_kms"]))
+	lines.append("[color=#8fa3bf]单程光时[/color]  %s      [color=#8fa3bf]往返[/color]  %s" % [
+		JDTime.duration_text(float(trk["owlt_sec"])),
+		JDTime.duration_text(float(trk["rtlt_sec"]))])
+	lines.append("[color=#8fa3bf]距太阳[/color]  %.2f AU    [color=#8fa3bf]日心速度[/color]  %.3f km/s" % [
+		helio_km / eph.au_km, speed])
 	lines.append("")
 	lines.append("[color=#8fa3bf]RTG 输出[/color]  %.1f W   [color=#d98a3a]〔模型推演，非遥测〕[/color]" % pw["watts"])
 	lines.append("  燃料剩余 %.1f%%   转换器效率 %.1f%%" % [
@@ -452,15 +592,120 @@ func _refresh() -> void:
 		lines.append("[color=#b06060]该时刻超出星历覆盖范围[/color]")
 	lbl_readout.text = "\n".join(lines)
 
+	# ---- 右栏：测控几何 ----
+	var t := PackedStringArray()
+	t.append("[b]测控几何[/b]  [color=#6f7f96]全部由星历推导[/color]")
+	t.append("[color=#8fa3bf]赤经[/color] %.3f°    [color=#8fa3bf]赤纬[/color] %+.3f°   [color=#6f7f96]← 天线往哪儿指[/color]"
+		% [float(trk["ra_deg"]), float(trk["dec_deg"])])
+	t.append("[color=#8fa3bf]X 波段多普勒[/color]  %+.1f Hz  (8.420 GHz 载波)" % float(trk["doppler_hz"]))
+	t.append("[color=#8fa3bf]日-地-探夹角 SEP[/color]  %.2f°%s" % [
+		float(trk["sep_deg"]),
+		"   [color=#c07050]← 接近太阳合，链路受太阳噪声压制[/color]" if float(trk["sep_deg"]) < 5.0 else ""])
+	t.append("")
+	t.append("[color=#8fa3bf]DSN 测站可见性[/color]  [color=#6f7f96](中天高度 > 10° 才够得着)[/color]")
+	for st_v in Geometry.visible_stations(float(trk["dec_deg"])):
+		var ok: bool = st_v["visible"]
+		t.append("  %s %-16s 中天 %+6.1f°  %s" % [
+			"[color=#5f9e6f]●[/color]" if ok else "[color=#7a4a4a]○[/color]",
+			String(st_v["name"]), float(st_v["culmination_deg"]),
+			"[color=#5f9e6f]可跟踪[/color]" if ok else "[color=#8a6060]地平线以下[/color]"])
+	lbl_tracking.text = "\n".join(t)
+
+	# ---- 右栏：链路预算 ----
+	var l := PackedStringArray()
+	l.append("[b]下行链路预算[/b]  [color=#6f7f96]18 W 行波管 + 3.7 m 碟 → DSN 70 m[/color]")
+	l.append("[color=#8fa3bf]自由空间路径损耗[/color]  %.1f dB" % float(link["fspl_db"]))
+	l.append("[color=#8fa3bf]DSN 接收信号[/color]  %.1f dBm" % float(link["rx_dbm"]))
+	l.append("[color=#6f7f96]损耗随距离平方增长 —— 这就是数据率从 115 kbps 一路降到 160 bps 的物理原因[/color]")
+	lbl_link.text = "\n".join(l)
+
+	# ---- 右栏：轨道能量 ----
+	var o := PackedStringArray()
+	o.append("[b]日心轨道[/b]")
+	o.append("[color=#8fa3bf]当前速度[/color] %.3f km/s   [color=#8fa3bf]该处逃逸速度[/color] %.3f km/s" % [
+		float(orb["speed_kms"]), float(orb["v_escape_kms"])])
+	if bool(orb["escaping"]):
+		o.append("[color=#5f9e6f]已达逃逸条件[/color]，双曲剩余速度 %.3f km/s（永不返回）" % float(orb["v_inf_kms"]))
+	else:
+		o.append("[color=#c0a060]仍在束缚轨道上[/color]")
+	o.append("[color=#8fa3bf]日球层顶[/color]  %s  [color=#6f7f96](119 AU，2018-11-05 穿越)[/color]" % (
+		"[color=#7f9fd0]已进入星际空间[/color]" if bool(orb["beyond_heliopause"]) else "仍在日球层内"))
+	var near := Geometry.nearest_body(probe["pos"], eph.bodies,
+		func(n: String, j: float) -> Dictionary: return eph.state_at(n, j), jd_now)
+	if String(near["name"]) != "":
+		o.append("[color=#8fa3bf]最近天体[/color]  %s   %s km  (%.4f AU)" % [
+			String(near["label"]), JDTime.sci(float(near["distance_km"])),
+			float(near["distance_km"]) / eph.au_km])
+	lbl_orbit.text = "\n".join(o)
+
+	# ---- 曲线标记 ----
+	var ratio := (jd_now - jd_min) / maxf(1e-9, jd_max - jd_min)
+	spark_power.marker_ratio = clampf(ratio, 0.0, 1.0)
+	spark_power.value_text = "%.1f W" % float(pw["watts"])
+	spark_power.queue_redraw()
+	spark_dist.marker_ratio = clampf(ratio, 0.0, 1.0)
+	spark_dist.value_text = "%.2f AU" % float(trk["range_au"])
+	spark_dist.queue_redraw()
+	spark_rx.marker_ratio = clampf(ratio, 0.0, 1.0)
+	spark_rx.value_text = "%.1f dBm" % float(link["rx_dbm"])
+	spark_rx.queue_redraw()
+
 	if selected_component == "":
-		var hint := "点击左下按钮切到探测器特写，再点选部件查看归属与置信度。"
+		var hint := "按 Tab 切到探测器特写，再[b]右键[/b]点选部件。"
 		if mode == ViewMode.CRAFT:
-			hint = "点选任意部件查看归属与置信度。"
+			hint = "[b]右键[/b]点选部件查看归属与置信度。试试舱体侧面那张金唱片。"
 		lbl_component.text = "[color=#8fa3bf]%s[/color]" % hint
 
 
+## 行星和探测器按真实比例在这个尺度下只有零点几个单位，拉远之后就是几个
+## 亚像素的点，等于看不见。所以标记随相机距离等比放大 —— 这是示意尺寸，
+## 不是真实比例，行星本体的相对大小仍然保留。
+func _scale_markers() -> void:
+	var k := maxf(1.0, cam_dist * 0.0016)
+	for n in planet_nodes:
+		planet_nodes[n].scale = Vector3.ONE * k
+	probe_marker.scale = Vector3.ONE * maxf(1.0, cam_dist * 0.0012)
+
+
+## 探测器↔地球连线。DSN 的上下行就走这条路径。
+func _rebuild_link_line(probe: Dictionary, earth: Dictionary) -> void:
+	var im: ImmediateMesh = link_line.mesh
+	im.clear_surfaces()
+	if not bool(probe["in_range"]) or not bool(earth["in_range"]):
+		return
+	var mat := StandardMaterial3D.new()
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.albedo_color = Color(0.35, 0.75, 0.95, 0.45)
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	im.surface_begin(Mesh.PRIMITIVE_LINES, mat)
+	im.surface_add_vertex(_to_units(earth["pos"]))
+	im.surface_add_vertex(_to_units(probe["pos"]))
+	im.surface_end()
+
+
+## 曲线数据只跟时间有关，启动时算一次即可。
+func _build_series() -> void:
+	var n := 320
+	var d := PackedFloat32Array()
+	var p := PackedFloat32Array()
+	var rx := PackedFloat32Array()
+	for i in n:
+		var jd := lerpf(jd_min, jd_max, float(i) / float(n - 1))
+		var pr := eph.state_at("voyager2", jd)
+		var ea := eph.state_at("earth", jd)
+		var tr := Geometry.tracking(pr, ea)
+		d.append(float(tr["range_au"]))
+		p.append(float(eph.power_at(jd)["watts"]))
+		rx.append(float(Geometry.link_budget(float(tr["range_km"]))["rx_dbm"]))
+	spark_dist.set_series(d, 1.0)
+	spark_power.set_series(p, 1.0)
+	spark_rx.set_series(rx, 1.0)
+
+
 func _update_camera() -> void:
-	var target := Vector3.ZERO
+	if mode == ViewMode.SYSTEM and probe_marker != null:
+		_scale_markers()
+	var target := craft_focus
 	if mode == ViewMode.SYSTEM:
 		target = probe_marker.position * 0.35
 	var dir := Vector3(
@@ -541,7 +786,10 @@ func _select_component(node_name: String) -> void:
 		prev.mesh.surface_set_material(0, original_materials[selected_component])
 	selected_component = node_name
 	var mi: MeshInstance3D = component_nodes[node_name]
-	mi.mesh.surface_set_material(0, highlight_material)
+	# 金唱片是唯一不做高亮的部件：它的价值就在那张真实的封面蚀刻贴图上，
+	# 换成纯色高亮材质等于把要看的东西盖掉。这里靠镜头推近来给反馈。
+	if node_name != "GoldenRecord":
+		mi.mesh.surface_set_material(0, highlight_material)
 
 	# 找出所有指向该节点的 ComponentID（含模型未区分的别名）。
 	var ids := []
@@ -574,6 +822,114 @@ func _select_component(node_name: String) -> void:
 	lines.append("[color=#6f7f96]NASA 不提供 Voyager 2 的公开工程遥测，[/color]")
 	lines.append("[color=#6f7f96]所以此处没有该部件的温度/电压读数 —— 没有就是没有。[/color]")
 	lbl_component.text = "\n".join(lines)
+
+	if node_name == "GoldenRecord":
+		_show_record_panel()
+		# 把镜头推到唱片上，让人直接看 NASA 模型自带的真实封面蚀刻图案。
+		craft_focus = mi.global_transform * record_center
+		# 唱片直径 0.314 m，要填满画面，相机距离取直径的 1.4 倍左右。
+		cam_dist = 0.45
+		cam_yaw = 1.5708
+		cam_pitch = 0.0
+		record_spinning = true
+		_update_camera()
+	else:
+		record_panel.visible = false
+		craft_focus = Vector3.ZERO
+		record_spinning = false
+		if record_node != null:
+			record_node.transform = record_orig_xform
+			record_angle = 0.0
+
+
+func _show_record_panel() -> void:
+	record_panel.visible = true
+	var spec := GoldenRecord.SPEC
+	var r := PackedStringArray()
+	r.append("[b]旅行者金唱片[/b]  [color=#c9a227]12 英寸镀金铜盘[/color]")
+	r.append("[color=#6f7f96]你现在看到的封面蚀刻图案是 NASA 模型自带的真实贴图：[/color]")
+	r.append("[color=#6f7f96]左上播放示意 · 右上二进制时基 · 中间图像光栅 · 左下 14 颗脉冲星定位图 · 右下氢原子跃迁[/color]")
+	r.append("")
+	r.append("转速 %s" % String(spec["rpm"]))
+	r.append("%s" % String(spec["clock"]))
+	r.append("载荷：%d 张图像 · %d 种语言问候 · %d 首乐曲（约 %d 分钟）· %d 分钟地球之声" % [
+		int(spec["images"]), int(spec["languages"]), int(spec["music_tracks"]),
+		int(spec["music_minutes"]), int(spec["sounds_minutes"])])
+	r.append("")
+	for sec in GoldenRecord.CONTENTS:
+		r.append("[b]%s[/b]" % String(sec["section"]))
+		if String(sec["note"]) != "":
+			r.append("  [color=#6f7f96]%s[/color]" % String(sec["note"]))
+		for it in sec["items"]:
+			r.append("  · %s" % String(it))
+		r.append("")
+	r.append("[color=#d98a3a]为什么这里没有唱片上的音乐：[/color]")
+	r.append("[color=#6f7f96]那 27 首绝大多数是受版权保护的商业录音，NASA 当年只取得一次性搭载[/color]")
+	r.append("[color=#6f7f96]授权，并未置于公有领域 —— NASA 自己的图库都因版权只展示 116 张图的一部分。[/color]")
+	r.append("[color=#6f7f96]所以这里不打包任何录音，只合成唱片上真实存在的物理信号：[/color]")
+	r.append("[color=#6f7f96]1000 Hz 参考校准音，以及图像的模拟扫描线编码。[/color]")
+	lbl_record.text = "\n".join(r)
+
+
+func _ensure_audio() -> AudioStreamGeneratorPlayback:
+	if audio == null:
+		audio = AudioStreamPlayer.new()
+		var gen := AudioStreamGenerator.new()
+		gen.mix_rate = GoldenRecord.SAMPLE_RATE
+		gen.buffer_length = 0.5
+		audio.stream = gen
+		add_child(audio)
+	if not audio.playing:
+		audio.play()
+	return audio.get_stream_playback() as AudioStreamGeneratorPlayback
+
+
+func _queue_audio(frames: PackedVector2Array) -> void:
+	audio_queue = frames
+	audio_cursor = 0
+	_ensure_audio()
+
+
+func _play_calibration() -> void:
+	_queue_audio(GoldenRecord.calibration_tone(2.5))
+	record_spinning = true
+
+
+func _play_scanlines() -> void:
+	# 用唱片封面自己的贴图做演示：把它按唱片的方式编码成扫描线音频。
+	# 这不是那 116 张图之一，但编码方式是真实的。
+	var img: Image = null
+	if record_node != null:
+		var mat := record_node.mesh.surface_get_material(0)
+		if mat is StandardMaterial3D:
+			var tex := (mat as StandardMaterial3D).albedo_texture
+			if tex != null:
+				img = tex.get_image()
+	if img == null:
+		# 退化情况：合成一幅同心圆图样，至少能听出扫描线的结构。
+		img = Image.create(96, 48, false, Image.FORMAT_RGB8)
+		for y in 48:
+			for x in 96:
+				var v := 0.5 + 0.5 * sin(sqrt(pow(x - 48.0, 2.0) + pow(y - 24.0, 2.0)) * 0.6)
+				img.set_pixel(x, y, Color(v, v, v))
+	_queue_audio(GoldenRecord.encode_image_scanlines(img))
+	record_spinning = true
+
+
+## 把排队的音频逐帧推给生成器。
+func _pump_audio() -> void:
+	if audio == null or audio_queue.is_empty():
+		return
+	var pb := audio.get_stream_playback() as AudioStreamGeneratorPlayback
+	if pb == null:
+		return
+	var n := pb.get_frames_available()
+	while n > 0 and audio_cursor < audio_queue.size():
+		pb.push_frame(audio_queue[audio_cursor])
+		audio_cursor += 1
+		n -= 1
+	if audio_cursor >= audio_queue.size():
+		audio_queue = PackedVector2Array()
 
 
 func _on_dsn_pressed() -> void:
@@ -653,6 +1009,8 @@ func _run_screenshot_harness() -> void:
 		{"name": "05_craft", "jd": jd_max, "mode": ViewMode.CRAFT, "dist": 30.0},
 		{"name": "06_craft_rtg", "jd": jd_max, "mode": ViewMode.CRAFT, "dist": 13.0,
 			"select": "RTG_2", "yaw": 1.9, "pitch": 0.15},
+		{"name": "07_golden_record", "jd": jd_max, "mode": ViewMode.CRAFT, "dist": 1.1,
+			"select": "GoldenRecord"},
 	]
 
 	for st in steps:

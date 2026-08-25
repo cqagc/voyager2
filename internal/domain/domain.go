@@ -145,6 +145,14 @@ const (
 	CompInstrumentPLS    ComponentID = "Instrument_PLS"
 	CompInstrumentMAG    ComponentID = "Instrument_MAG"
 	CompInstrumentPWS    ComponentID = "Instrument_PWS"
+
+	// CompGoldenRecord is the 12-inch gold-plated copper phonograph record
+	// bolted to the outside of the bus. NASA's visual model carries the real
+	// etched cover artwork as a texture -- the playback diagram, the binary
+	// time base, the image raster, the 14-pulsar map locating the Sun, and the
+	// hydrogen hyperfine transition -- so this is identifiable geometry rather
+	// than a guess. Measured disc diameter is 0.314 m against 0.305 m actual.
+	CompGoldenRecord ComponentID = "GoldenRecord"
 )
 
 // AllComponents is the authoritative component list. The Blender split must
@@ -156,4 +164,5 @@ var AllComponents = []ComponentID{
 	CompMagnetometerBoom, CompScienceBoom, CompScanPlatform, CompThrusters,
 	CompInstrumentCRS, CompInstrumentLECP, CompInstrumentPLS,
 	CompInstrumentMAG, CompInstrumentPWS,
+	CompGoldenRecord,
 }
