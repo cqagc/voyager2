@@ -3,6 +3,26 @@ package horizons
 import "github.com/cqagc/voyager2/internal/domain"
 
 // Bodies lists every natural body and spacecraft tracked by the twin.
+// FrameOrigin is the body that sits at the origin of the reference frame the
+// whole project uses (heliocentric ecliptic J2000). Its state vector is
+// identically zero by definition, so it must never be fetched: Horizons treats
+// target == center as a degenerate request and stalls for minutes before
+// timing out. The 2026-08-26 baseline ingest lost two minutes exactly this way.
+const FrameOrigin = domain.BodySun
+
+// Fetchable returns the bodies that should actually be requested from
+// Horizons, i.e. every tracked body except the frame origin.
+func Fetchable() []domain.Body {
+	out := make([]domain.Body, 0, len(Bodies))
+	for _, b := range Bodies {
+		if b.ID == FrameOrigin {
+			continue
+		}
+		out = append(out, b)
+	}
+	return out
+}
+
 var Bodies = []domain.Body{
 	{
 		ID:           domain.BodyVoyager2,

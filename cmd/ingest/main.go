@@ -24,13 +24,14 @@ const voyager2LaunchDate = "1977-08-20"
 var errPartialFailure = errors.New("one or more bodies failed")
 
 type config struct {
-	dbPath   string
-	start    string
-	stop     string
-	step     string
-	bodies   string
-	cacheDir string
-	dryRun   bool
+	dbPath      string
+	start       string
+	stop        string
+	step        string
+	httpTimeout time.Duration
+	bodies      string
+	cacheDir    string
+	dryRun      bool
 }
 
 func main() {
@@ -76,7 +77,7 @@ func run(ctx context.Context, args []string) (resultErr error) {
 	}
 
 	client := horizons.NewClient(horizons.ClientOptions{
-		HTTPClient:  &http.Client{Timeout: 2 * time.Minute},
+		HTTPClient:  &http.Client{Timeout: cfg.httpTimeout},
 		MinInterval: horizons.DefaultMinInterval,
 		CacheDir:    cfg.cacheDir,
 	})
@@ -101,6 +102,25 @@ func run(ctx context.Context, args []string) (resultErr error) {
 			"step", query.Step,
 		)
 		vectors, err := client.FetchSegmented(ctx, query, horizons.DefaultMaxRecords)
+		if err != nil {
+			// Horizons refuses the whole window when it starts before a
+			// target's SPK coverage. Spacecraft coverage begins at launch
+			// (Voyager 2: 1977-08-20 15:32:32 TDB), not at midnight, so the
+			// default launch-DAY start is rejected. Recover the real coverage
+			// start from the refusal and retry once instead of dropping the
+			// most important body in the project.
+			if earliest, ok := horizons.EarliestEpochFromError(err); ok {
+				retry := query
+				retry.Start = horizons.FormatHorizonsTime(earliest)
+				slog.Warn(
+					"window starts before ephemeris coverage; retrying from coverage start",
+					"body", body.Name,
+					"requested_start", query.Start,
+					"coverage_start", retry.Start,
+				)
+				vectors, err = client.FetchSegmented(ctx, retry, horizons.DefaultMaxRecords)
+			}
+		}
 		if err != nil {
 			failures++
 			slog.Error("body fetch failed", "body", body.Name, "body_id", body.ID, "err", err)
@@ -142,6 +162,8 @@ func parseFlags(args []string) (config, error) {
 	flags.StringVar(&cfg.start, "start", voyager2LaunchDate, "开始日期 YYYY-MM-DD")
 	flags.StringVar(&cfg.stop, "stop", time.Now().Format(time.DateOnly), "结束日期 YYYY-MM-DD")
 	flags.StringVar(&cfg.step, "step", "1 d", "Horizons 采样步长")
+	flags.DurationVar(&cfg.httpTimeout, "http-timeout", horizons.DefaultHTTPTimeout,
+		"单次 Horizons 请求超时；航天器星历远慢于行星，勿调低")
 	flags.StringVar(&cfg.bodies, "bodies", "all", "逗号分隔的天体 name，all 表示全部")
 	flags.StringVar(&cfg.cacheDir, "cache-dir", "data/raw", "Horizons 原始响应缓存目录")
 	flags.BoolVar(&cfg.dryRun, "dry-run", false, "只打印抓取计划")
@@ -153,7 +175,7 @@ func parseFlags(args []string) (config, error) {
 
 func selectBodies(value string) ([]domain.Body, error) {
 	if strings.EqualFold(strings.TrimSpace(value), "all") || strings.TrimSpace(value) == "" {
-		return append([]domain.Body(nil), horizons.Bodies...), nil
+		return horizons.Fetchable(), nil
 	}
 
 	byName := make(map[string]domain.Body, len(horizons.Bodies))

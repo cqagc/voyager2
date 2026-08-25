@@ -24,6 +24,14 @@ const (
 	Endpoint = "https://ssd.jpl.nasa.gov/api/horizons.api"
 	// DefaultMinInterval is the default delay between outbound requests.
 	DefaultMinInterval = time.Second
+
+	// DefaultHTTPTimeout must accommodate the slowest single request the
+	// project makes: Voyager 2's full 49-year daily ephemeris. Spacecraft SPK
+	// queries are far slower than planetary ones -- the 2026-08-26 baseline
+	// ingest lost the spacecraft itself to a 2-minute timeout -- so this is
+	// deliberately generous. Segmentation bounds response size, not the
+	// server-side integration work.
+	DefaultHTTPTimeout = 10 * time.Minute
 	// DefaultMaxRecords is the maximum number of records requested per segment.
 	DefaultMaxRecords = 90000
 )
