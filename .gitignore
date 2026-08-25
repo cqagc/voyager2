@@ -4,3 +4,9 @@
 /data/raw/
 /assets/generated/
 *.blend1
+
+# Godot 导入缓存
+/godot/.godot/
+# 生成物：由 cmd/export 与 tools/model/assign.py 产出，不入库
+/godot/data/
+/godot/assets/*.glb
