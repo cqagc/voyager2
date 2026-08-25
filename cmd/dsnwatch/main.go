@@ -71,10 +71,9 @@ func printState(state domain.LinkState, history []domain.LinkState, jsonOutput b
 		return nil
 	}
 
-	rtltHours := state.RoundTripLightTimeSec / 3600
-	oneWayHours := rtltHours / 2
-	fmt.Printf("正在跟踪｜天线 %s｜站点 %s｜下行 %.0f bps｜信号 %.1f dBm｜往返光时 %.2f 小时（单程 %.2f 小时）\n",
-		state.Antenna, state.Site, state.DownlinkBitrate, state.SignalPowerDBm, rtltHours, oneWayHours)
+	fmt.Printf("正在跟踪｜天线 %s｜站点 %s｜下行 %.0f bps｜信号 %.1f dBm｜%s\n",
+		state.Antenna, state.Site, state.DownlinkBitrate, state.SignalPowerDBm,
+		formatLightTime(state.RoundTripLightTimeSec))
 	return nil
 }
 
@@ -85,4 +84,23 @@ func lastConnectedAt(history []domain.LinkState) time.Time {
 		}
 	}
 	return time.Time{}
+}
+
+// formatLightTime renders round-trip light time at a scale a human can read,
+// and says so when the feed has no value.
+//
+// The DSN feed uses rtlt="-1" for "no data", which the parser normalises to 0.
+// Printing that as "0.00 小时" is a lie: it made JWST -- 1.5 million km away,
+// about 10 s round trip -- report zero light time. Absent data must look absent.
+func formatLightTime(sec float64) string {
+	if sec <= 0 {
+		return "往返光时：该馈送未提供"
+	}
+	if sec < 120 {
+		return fmt.Sprintf("往返光时 %.1f 秒（单程 %.1f 秒）", sec, sec/2)
+	}
+	if sec < 7200 {
+		return fmt.Sprintf("往返光时 %.1f 分钟（单程 %.1f 分钟）", sec/60, sec/120)
+	}
+	return fmt.Sprintf("往返光时 %.2f 小时（单程 %.2f 小时）", sec/3600, sec/7200)
 }
