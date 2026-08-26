@@ -93,6 +93,7 @@ var audio_cursor := 0
 # 太阳系视图里的地球连线（DSN 链路那条线）
 var link_line: MeshInstance3D
 var craft_focus := Vector3.ZERO
+var _drag_travel := 0.0
 var _syncing_slider := false
 
 
@@ -122,6 +123,8 @@ func _ready() -> void:
 		_run_screenshot_harness.call_deferred()
 	if "--dsntest" in OS.get_cmdline_user_args():
 		_run_dsn_selftest.call_deferred()
+	if "--picktest" in OS.get_cmdline_user_args():
+		_run_pick_selftest.call_deferred()
 	print("孪生体就绪：%d 天体，%d 组件，时间跨度 %s .. %s" % [
 		eph.bodies.size(), eph.components.size(),
 		JDTime.format_date_short(jd_min), JDTime.format_date_short(jd_max)])
@@ -307,8 +310,15 @@ func _build_craft_view() -> void:
 
 func _index_components(node: Node) -> void:
 	if node is MeshInstance3D:
-		component_nodes[node.name] = node
-		original_materials[node.name] = (node as MeshInstance3D).mesh.surface_get_material(0)
+		var mi := node as MeshInstance3D
+		component_nodes[mi.name] = mi
+		original_materials[mi.name] = mi.mesh.surface_get_material(0)
+		# 生成三角网格碰撞体，供精确拾取。
+		#
+		# 早先用的是「包围盒射线求交 + 取进入距离最近者」，在嵌套包围盒下
+		# 必然失效：Bus 的包围盒把金唱片整个包住，射线先进 Bus 的盒子，
+		# 于是点唱片永远选中 Bus。必须按真实三角面拾取。
+		mi.create_trimesh_collision()
 	for c in node.get_children():
 		_index_components(c)
 
@@ -385,6 +395,11 @@ func _build_ui() -> void:
 	right_col.add_theme_constant_override("separation", 6)
 	right_scroll.add_child(right_col)
 
+	record_panel = PanelContainer.new()
+	record_panel.mouse_filter = Control.MOUSE_FILTER_STOP
+	record_panel.visible = false
+	right_col.add_child(record_panel)
+
 	lbl_tracking = _panel_label(right_col, 450)
 	lbl_link = _panel_label(right_col, 450)
 
@@ -398,10 +413,6 @@ func _build_ui() -> void:
 	lbl_orbit = _panel_label(right_col, 450)
 	lbl_component = _panel_label(right_col, 450)
 
-	record_panel = PanelContainer.new()
-	record_panel.mouse_filter = Control.MOUSE_FILTER_STOP
-	record_panel.visible = false
-	right_col.add_child(record_panel)
 	var rv := VBoxContainer.new()
 	record_panel.add_child(rv)
 	var rscroll := ScrollContainer.new()
@@ -719,6 +730,7 @@ func _unhandled_input(event: InputEvent) -> void:
 		return
 	if event is InputEventMouseMotion and (event as InputEventMouseMotion).button_mask & MOUSE_BUTTON_MASK_LEFT:
 		var mm := event as InputEventMouseMotion
+		_drag_travel += mm.relative.length()
 		cam_yaw -= mm.relative.x * 0.006
 		cam_pitch = clampf(cam_pitch + mm.relative.y * 0.006, -1.45, 1.45)
 		_update_camera()
@@ -732,6 +744,12 @@ func _unhandled_input(event: InputEvent) -> void:
 			_update_camera()
 		elif mb.button_index == MOUSE_BUTTON_RIGHT and mb.pressed and mode == ViewMode.CRAFT:
 			_pick_component(mb.position)
+		elif mb.button_index == MOUSE_BUTTON_LEFT:
+			# 左键按下开始计拖动距离；松手时几乎没动，就当作点选。
+			if mb.pressed:
+				_drag_travel = 0.0
+			elif _drag_travel < 6.0 and mode == ViewMode.CRAFT:
+				_pick_component(mb.position)
 	elif event is InputEventKey and (event as InputEventKey).pressed:
 		var k := event as InputEventKey
 		if k.keycode == KEY_SPACE:
@@ -740,43 +758,26 @@ func _unhandled_input(event: InputEvent) -> void:
 			_on_mode_pressed()
 
 
-## 部件点选。glb 里没有碰撞体，所以直接对每个组件的世界 AABB 做射线求交
-## —— 比生成碰撞形状简单，对这个用途也足够。
+## 部件点选：对三角网格做物理射线求交，精确到面。
 func _pick_component(screen_pos: Vector2) -> void:
 	var from := camera.project_ray_origin(screen_pos)
-	var dir := camera.project_ray_normal(screen_pos)
-	var best := ""
-	var best_t := INF
-	for name_str in component_nodes:
-		var mi: MeshInstance3D = component_nodes[name_str]
-		var aabb := mi.global_transform * mi.get_aabb()
-		var t := _ray_aabb(from, dir, aabb)
-		if t >= 0.0 and t < best_t:
-			best_t = t
-			best = name_str
-	if best == "":
+	var to := from + camera.project_ray_normal(screen_pos) * 2000.0
+	var space := get_world_3d().direct_space_state
+	var q := PhysicsRayQueryParameters3D.create(from, to)
+	q.collide_with_areas = false
+	q.collide_with_bodies = true
+	var hit := space.intersect_ray(q)
+	if hit.is_empty():
 		return
-	_select_component(best)
-
-
-func _ray_aabb(from: Vector3, dir: Vector3, box: AABB) -> float:
-	var tmin := -INF
-	var tmax := INF
-	var bmin := box.position
-	var bmax := box.position + box.size
-	for i in 3:
-		var d: float = dir[i]
-		if absf(d) < 1e-9:
-			if from[i] < bmin[i] or from[i] > bmax[i]:
-				return -1.0
-			continue
-		var t1 := (bmin[i] - from[i]) / d
-		var t2 := (bmax[i] - from[i]) / d
-		tmin = maxf(tmin, minf(t1, t2))
-		tmax = minf(tmax, maxf(t1, t2))
-	if tmax < maxf(tmin, 0.0):
-		return -1.0
-	return maxf(tmin, 0.0)
+	# create_trimesh_collision() 把 StaticBody3D 挂成 MeshInstance3D 的子节点，
+	# 所以碰撞体的父节点就是组件本身。
+	var collider: Object = hit.get("collider")
+	if collider == null or not (collider is Node):
+		return
+	var owner_node := (collider as Node).get_parent()
+	if owner_node == null or not component_nodes.has(owner_node.name):
+		return
+	_select_component(owner_node.name)
 
 
 func _select_component(node_name: String) -> void:
@@ -1055,4 +1056,75 @@ func _run_dsn_selftest() -> void:
 	print("DSNTEST %s" % lbl_dsn.text)
 	# 顺带用一个确定在被跟踪的航天器做阳性对照，证明解析器不是永远返回未跟踪。
 	print("DSNTEST_DONE")
+	get_tree().quit()
+
+
+## 拾取自检：对每个部件取若干真实表面点，从模型外侧朝该点看，打射线验证
+## 选中的是不是它自己。
+##
+## 这条自检守的是一个真实踩过的坑：早先用包围盒求交 + 取最近进入点，在嵌套
+## 包围盒下必然失效 —— Bus 的盒子把金唱片整个包住，点唱片永远选中 Bus。
+## 肉眼看截图看不出这种问题，必须让机器判。
+##
+## 注意瞄准点必须取**真实顶点**而不是包围盒中心：磁强计桁架、推力器、鞭状
+## 天线这类细杆/格栅件，包围盒中心是空气，射线会从缝里穿过去，那是测试瞄错
+## 了地方，不是拾取坏了。
+##   Godot --path . -- --picktest
+func _run_pick_selftest() -> void:
+	_set_mode(ViewMode.CRAFT)
+	var model_center := Vector3.ZERO
+	if component_nodes.has("Bus"):
+		var bus: MeshInstance3D = component_nodes["Bus"]
+		var bab := bus.get_aabb()
+		model_center = bus.global_transform * (bab.position + bab.size * 0.5)
+
+	var pass_n := 0
+	var fail_n := 0
+	var report := PackedStringArray()
+	for name_str in component_nodes.keys():
+		var mi: MeshInstance3D = component_nodes[name_str]
+		var verts: PackedVector3Array = mi.mesh.get_faces()
+		if verts.is_empty():
+			continue
+		# 取若干均匀分布的表面点，只要有一个能被正确选中就算通过
+		# （被遮挡的表面点选不中是合理行为：看不见的东西本来就点不到）。
+		var tries := 12
+		var ok := false
+		var last_got := "(未命中)"
+		for k in tries:
+			var idx := int(float(k) / float(tries) * float(verts.size()))
+			idx = clampi(idx, 0, verts.size() - 1)
+			var target: Vector3 = mi.global_transform * verts[idx]
+			var outward := (target - model_center)
+			if outward.length() < 1e-4:
+				outward = Vector3(1, 0.4, 0.3)
+			outward = outward.normalized()
+
+			craft_focus = target
+			camera.position = target + outward * 2.2
+			camera.look_at(target, Vector3.UP)
+			await get_tree().physics_frame
+
+			var sc := get_viewport().get_visible_rect().size * 0.5
+			var from := camera.project_ray_origin(sc)
+			var to := from + camera.project_ray_normal(sc) * 2000.0
+			var hit := get_world_3d().direct_space_state.intersect_ray(
+				PhysicsRayQueryParameters3D.create(from, to))
+			if hit.is_empty():
+				continue
+			var col: Object = hit.get("collider")
+			if col is Node and (col as Node).get_parent() != null:
+				last_got = (col as Node).get_parent().name
+				if last_got == name_str:
+					ok = true
+					break
+		if ok:
+			pass_n += 1
+			report.append("PICKTEST %-18s OK" % name_str)
+		else:
+			fail_n += 1
+			report.append("PICKTEST %-18s FAIL -> 最后命中 %s" % [name_str, last_got])
+	for line in report:
+		print(line)
+	print("PICKTEST_DONE pass=%d fail=%d" % [pass_n, fail_n])
 	get_tree().quit()
