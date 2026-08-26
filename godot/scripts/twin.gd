@@ -14,6 +14,12 @@ extends Node3D
 const AU_UNITS := 10.0
 const PLANET_EXAGGERATION := 620.0
 const SUN_RADIUS := 3.2
+
+## 与 planet.gdshader 里的 kind 分支一一对应。
+const KIND_ID := {
+	"rocky": 0, "venus": 1, "earth": 2, "mars": 3, "gas": 4,
+	"ice": 5, "io": 6, "europa": 7, "titan": 8, "triton": 9,
+}
 const TRAJECTORY_SAMPLES := 2400
 
 enum ViewMode { SYSTEM, CRAFT }
@@ -43,6 +49,8 @@ var fatal_error := ""
 # 太阳系视图
 var system_root: Node3D
 var planet_nodes := {}
+var planet_spin := {}
+var saturn_rings: MeshInstance3D
 var probe_marker: MeshInstance3D
 var probe_root: Node3D
 var probe_model: Node3D
@@ -209,55 +217,70 @@ func _build_system_view() -> void:
 			continue
 		var radius_units := clampf(
 			float(b["mean_radius_km"]) / eph.au_km * AU_UNITS * PLANET_EXAGGERATION, 0.5, 8.0)
+
+		# 三层结构：pivot 定位 / tilt 摆自转轴 / mesh 自转。
+		# 环必须挂在 tilt 下面，因为环位于行星赤道面内，跟着自转轴一起倾斜。
+		var pivot := Node3D.new()
+		pivot.name = name_str
+		system_root.add_child(pivot)
+
+		var tilt := Node3D.new()
+		# 对轨道倾角。天王星 97.8° —— 它基本是躺着转的。
+		tilt.rotation_degrees = Vector3(0, 0, float(BodyData.OBLIQUITY.get(name_str, 0.0)))
+		pivot.add_child(tilt)
+
 		var node := MeshInstance3D.new()
 		var mesh := SphereMesh.new()
 		mesh.radius = radius_units
 		mesh.height = radius_units * 2.0
+		mesh.radial_segments = 48
+		mesh.rings = 24
 		node.mesh = mesh
-		mesh.radial_segments = 40
-		mesh.rings = 20
 		var col: Color = PLANET_COLORS.get(name_str, Color(0.7, 0.7, 0.7))
 		var mat := ShaderMaterial.new()
 		mat.shader = load("res://shaders/planet.gdshader")
 		mat.set_shader_parameter("base_color", col)
-		# 气态巨行星给纬向条带，岩质行星只做轻微斑驳。
-		var gas := name_str in ["jupiter", "saturn", "uranus", "neptune"]
-		mat.set_shader_parameter("band_strength", 0.95 if gas else 0.0)
-		# 带纹色调与频率按行星区分：木星条带最密最强，天王星几乎没有。
+		mat.set_shader_parameter("kind", KIND_ID.get(String(BodyData.KIND.get(name_str, "rocky")), 0))
+		var atmo: Dictionary = BodyData.ATMOSPHERE.get(name_str, {})
+		mat.set_shader_parameter("atmo_color", atmo.get("color", Color(0.5, 0.7, 1.0)))
+		mat.set_shader_parameter("atmo_power", float(atmo.get("power", 0.0)))
 		match name_str:
 			"jupiter":
 				mat.set_shader_parameter("band_tint", Color(0.62, 0.38, 0.24))
 				mat.set_shader_parameter("band_freq", 11.0)
+				# 大红斑：一个跨了几百年的反气旋。
+				mat.set_shader_parameter("spot_size", 0.30)
+				mat.set_shader_parameter("spot_color", Color(0.80, 0.34, 0.20))
 			"saturn":
 				mat.set_shader_parameter("band_tint", Color(0.72, 0.56, 0.34))
 				mat.set_shader_parameter("band_freq", 8.0)
 			"uranus":
-				mat.set_shader_parameter("band_tint", Color(0.66, 0.86, 0.90))
 				mat.set_shader_parameter("band_freq", 4.0)
 			"neptune":
-				mat.set_shader_parameter("band_tint", Color(0.30, 0.42, 0.78))
 				mat.set_shader_parameter("band_freq", 6.0)
+				# 大暗斑（1989 年旅行者 2 号拍到的那个，后来消失了）
+				mat.set_shader_parameter("spot_size", 0.26)
+				mat.set_shader_parameter("spot_lat", -0.42)
+				mat.set_shader_parameter("spot_color", Color(0.10, 0.16, 0.42))
 		node.material_override = mat
-		node.name = name_str
-		system_root.add_child(node)
-		planet_nodes[name_str] = node
+		tilt.add_child(node)
+
+		planet_nodes[name_str] = pivot
+		planet_spin[name_str] = node
+
+		if name_str == "saturn":
+			tilt.add_child(_build_saturn_rings(radius_units))
 
 		if name_str in ORBIT_BODIES:
 			system_root.add_child(_build_path_mesh(name_str, jd_min, jd_max,
-				Color(col, 0.45), 600))
-
-	# Voyager 2 的完整航迹。
-	system_root.add_child(_build_path_mesh("voyager2", jd_min, jd_max,
-		Color(0.48, 0.55, 0.70, 0.85), TRAJECTORY_SAMPLES))
-
-	# 已飞过的那一段，随时间轴增长。
-	traveled_mesh = MeshInstance3D.new()
-	traveled_mesh.mesh = ImmediateMesh.new()
-	system_root.add_child(traveled_mesh)
+				col.lerp(Color(0.35, 0.85, 1.0), 0.55), Color(0.55, 0.35, 1.0), 700,
+				0.22, 0.0009, 2.0))
 
 	# 探测器↔地球连线：这就是 DSN 上下行走的那条路径。
 	link_line = MeshInstance3D.new()
 	link_line.mesh = ImmediateMesh.new()
+	link_line.extra_cull_margin = 100000.0
+	link_line.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	system_root.add_child(link_line)
 
 	# 探测器用真实模型，不用色点。
@@ -316,39 +339,146 @@ func _all_meshes(node: Node) -> Array:
 	return out
 
 
-func _build_path_mesh(body: String, from_jd: float, to_jd: float, color: Color, samples: int) -> MeshInstance3D:
-	var im := ImmediateMesh.new()
-	var mat := StandardMaterial3D.new()
-	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	mat.albedo_color = color
-	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	mat.vertex_color_use_as_albedo = false
-	im.surface_begin(Mesh.PRIMITIVE_LINE_STRIP, mat)
+## 土星环。真实半径数据见 BodyData。
+func _build_saturn_rings(planet_radius: float) -> MeshInstance3D:
+	var inner := planet_radius * BodyData.RING_INNER
+	var outer := planet_radius * BodyData.RING_OUTER
+	var segs := 192
+
+	var verts := PackedVector3Array()
+	var uvs := PackedVector2Array()
+	var norms := PackedVector3Array()
+	var idx := PackedInt32Array()
+	for i in segs + 1:
+		var a := TAU * float(i) / float(segs)
+		var ca := cos(a)
+		var sa := sin(a)
+		verts.append(Vector3(ca * inner, 0.0, sa * inner))
+		uvs.append(Vector2(0.0, 0.0))
+		norms.append(Vector3.UP)
+		verts.append(Vector3(ca * outer, 0.0, sa * outer))
+		uvs.append(Vector2(1.0, 0.0))
+		norms.append(Vector3.UP)
+	for i in segs:
+		var b := i * 2
+		idx.append_array([b, b + 1, b + 2, b + 1, b + 3, b + 2])
+
+	var arr := []
+	arr.resize(Mesh.ARRAY_MAX)
+	arr[Mesh.ARRAY_VERTEX] = verts
+	arr[Mesh.ARRAY_TEX_UV] = uvs
+	arr[Mesh.ARRAY_NORMAL] = norms
+	arr[Mesh.ARRAY_INDEX] = idx
+	var am := ArrayMesh.new()
+	am.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
+
+	var mi := MeshInstance3D.new()
+	mi.mesh = am
+	mi.name = "SaturnRings"
+	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	var mat := ShaderMaterial.new()
+	mat.shader = load("res://shaders/rings.gdshader")
+	var bands := BodyData.ring_bands()
+	for k in bands:
+		mat.set_shader_parameter(k, float(bands[k]))
+	mat.set_shader_parameter("planet_radius", planet_radius)
+	mi.material_override = mat
+	saturn_rings = mi
+	return mi
+
+
+## 轨迹带。用面向相机的三角带而不是线段 —— Godot 的线没有宽度。
+##
+## 每个路径点吐两个顶点（UV.y = ±1），顶点着色器沿「切线 × 视线」把它们
+## 撑开成恒定屏幕宽度的带子。NORMAL 存切线。
+func _build_ribbon(points: PackedVector3Array, width: float,
+		col_a: Color, col_b: Color, alpha: float, pulses: float,
+		trail_falloff: float = 0.0) -> MeshInstance3D:
+	var n := points.size()
+	var mi := MeshInstance3D.new()
+	if n < 2:
+		mi.mesh = ImmediateMesh.new()
+		return mi
+
+	var verts := PackedVector3Array()
+	var uvs := PackedVector2Array()
+	var norms := PackedVector3Array()
+	var idx := PackedInt32Array()
+	for i in n:
+		var tangent: Vector3
+		if i == 0:
+			tangent = points[1] - points[0]
+		elif i == n - 1:
+			tangent = points[n - 1] - points[n - 2]
+		else:
+			tangent = points[i + 1] - points[i - 1]
+		if tangent.length() < 1e-9:
+			tangent = Vector3.FORWARD
+		tangent = tangent.normalized()
+		var t := float(i) / float(n - 1)
+		verts.append(points[i]); uvs.append(Vector2(t, -1.0)); norms.append(tangent)
+		verts.append(points[i]); uvs.append(Vector2(t, 1.0)); norms.append(tangent)
+	for i in n - 1:
+		var b := i * 2
+		idx.append_array([b, b + 1, b + 2, b + 1, b + 3, b + 2])
+
+	var arr := []
+	arr.resize(Mesh.ARRAY_MAX)
+	arr[Mesh.ARRAY_VERTEX] = verts
+	arr[Mesh.ARRAY_TEX_UV] = uvs
+	arr[Mesh.ARRAY_NORMAL] = norms
+	arr[Mesh.ARRAY_INDEX] = idx
+	var am := ArrayMesh.new()
+	am.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
+	mi.mesh = am
+	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	# 轨迹跨越整个太阳系，包围盒算出来会导致远处被剔除，直接关掉剔除。
+	mi.extra_cull_margin = 100000.0
+
+	var mat := ShaderMaterial.new()
+	mat.shader = load("res://shaders/path.gdshader")
+	mat.set_shader_parameter("color_a", col_a)
+	mat.set_shader_parameter("color_b", col_b)
+	mat.set_shader_parameter("base_alpha", alpha)
+	mat.set_shader_parameter("pulse_count", pulses)
+	mat.set_shader_parameter("width_screen", width)
+	mat.set_shader_parameter("trail_falloff", trail_falloff)
+	mi.material_override = mat
+	return mi
+
+
+func _build_path_mesh(body: String, from_jd: float, to_jd: float,
+		col_a: Color, col_b: Color, samples: int,
+		alpha: float, width: float, pulses: float) -> MeshInstance3D:
+	var pts := PackedVector3Array()
 	for i in samples:
 		var jd := lerpf(from_jd, to_jd, float(i) / float(samples - 1))
-		var st := eph.state_at(body, jd)
-		im.surface_add_vertex(_to_units(st["pos"]))
-	im.surface_end()
-	var mi := MeshInstance3D.new()
-	mi.mesh = im
+		pts.append(_to_units(eph.state_at(body, jd)["pos"]))
+	var mi := _build_ribbon(pts, width, col_a, col_b, alpha, pulses)
 	mi.name = body + "_path"
 	return mi
 
 
+## 已飞过的航迹。
+##
+## 和行星轨道刻意做出区别：更粗、更亮、青→品红的渐变，脉冲更快，
+## 而且**末端最亮往回衰减** —— 视觉上拖着一条尾巴，一眼能看出探测器
+## 正往哪儿走、走了多久。
 func _rebuild_traveled() -> void:
-	var im: ImmediateMesh = traveled_mesh.mesh
-	im.clear_surfaces()
+	if traveled_mesh != null and is_instance_valid(traveled_mesh):
+		traveled_mesh.queue_free()
+	traveled_mesh = null
 	if jd_now <= jd_min:
 		return
-	var mat := StandardMaterial3D.new()
-	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	mat.albedo_color = Color(1.0, 0.55, 0.25)
-	im.surface_begin(Mesh.PRIMITIVE_LINE_STRIP, mat)
-	var n := 900
+	var n := 700
+	var pts := PackedVector3Array()
 	for i in n:
 		var jd := lerpf(jd_min, jd_now, float(i) / float(n - 1))
-		im.surface_add_vertex(_to_units(eph.state_at("voyager2", jd)["pos"]))
-	im.surface_end()
+		pts.append(_to_units(eph.state_at("voyager2", jd)["pos"]))
+	traveled_mesh = _build_ribbon(pts, 0.0021,
+		Color(0.10, 0.95, 1.0), Color(1.0, 0.20, 0.72), 0.34, 5.0, 1.7)
+	traveled_mesh.name = "TraveledPath"
+	system_root.add_child(traveled_mesh)
 
 
 ## 日心公里 -> 太阳系视图单位。除法在 float64 里完成，只有最后才落到 Vector3。
@@ -653,6 +783,7 @@ func _refresh() -> void:
 		var st := eph.state_at(name_str, jd_now)
 		planet_nodes[name_str].position = _to_units(st["pos"])
 		planet_nodes[name_str].visible = st["in_range"]
+		_spin_body(name_str)
 
 	probe_root.position = _to_units(probe["pos"])
 	probe_root.visible = in_range
@@ -776,16 +907,18 @@ func _scale_markers() -> void:
 	# 拉近检视本来就是核心操作。
 	#
 	# 现在：pk = max(近处固定值, cam_dist × 系数)
-	#   近处 —— 固定 1.1。基准要看**碟面**（直径 3.8）而不是整机跨度 17，
-	#           因为那 17 里有 15 米是几乎看不见的磁强计桁架。1.1 让碟面到
-	#           4.2 个单位，cam_dist 14 时占屏高约 20%，推到最近会充满画面。
+	#   近处 —— 固定 0.50。基准要看**碟面**（直径 3.8）而不是整机跨度 17，
+	#           因为那 17 里有 15 米是几乎看不见的磁强计桁架。
+	#           原本取 1.1，但飞掠时探测器把行星整个挡住了 —— 天王星特写里
+	#           两者只隔 100 万公里，夸张后的探测器直接盖在行星前面。
+	#           压到 0.50 后仍可推近到充满画面（cam_dist 3 时占屏高约 41%）。
 	#   远处 —— 按 0.0011·d 放大以免消失，上限 5.0。
 	#
 	# 这个远处系数是压过一次的：早先取 0.016，结果在木星飞掠的视距上探测器
 	# 的碟面有 9.7 个单位、而木星直径只有 3.7 —— 探测器比木星还大，荒谬。
 	# 两者的夸张倍数本来就天差地别（行星约 620 倍，探测器约 4 亿倍），
 	# 没有诚实的可比性，但至少不能让人看出「探测器比行星大」这种反直觉画面。
-	var pk := clampf(maxf(1.10, cam_dist * 0.0011), 1.10, 5.0)
+	var pk := clampf(maxf(0.50, cam_dist * 0.0011), 0.50, 5.0)
 	if probe_model != null:
 		probe_model.scale = Vector3.ONE * pk
 	# 光晕只是**远距离的定位提示**：拉远时它是唯一能让人找到探测器的线索，
@@ -794,6 +927,25 @@ func _scale_markers() -> void:
 	probe_marker.visible = halo_on
 	if halo_on:
 		probe_marker.scale = Vector3.ONE * clampf(cam_dist * 0.0075, 1.0, 46.0)
+
+
+## 天体自转。
+##
+## 自转**速率**用真实的恒星自转周期（NASA Planetary Fact Sheet），负号为逆行
+## —— 金星和天王星确实是倒着转的。但**绝对相位是任意的**：要定死相位需要
+## 各天体本初子午线在 J2000 的定向（IAU 的 W0/W1 参数），那份数据本项目没有
+## 接入，所以这里只保证转速和转向正确，不假装知道此刻哪一面朝着我们。
+##
+## 时间轴快放时行星会转成一团模糊 —— 那是如实的：木星 9.93 小时一圈，
+## 按 60 天/秒播放时它每秒真的转 145 圈。
+func _spin_body(name_str: String) -> void:
+	if not planet_spin.has(name_str):
+		return
+	var hours: float = float(BodyData.ROTATION_HOURS.get(name_str, 0.0))
+	if absf(hours) < 1e-6:
+		return
+	var turns := (jd_now - jd_min) * 24.0 / hours
+	planet_spin[name_str].rotation.y = fmod(turns, 1.0) * TAU
 
 
 ## 平行光方向 = 从太阳射向探测器。
@@ -1175,7 +1327,14 @@ func _run_screenshot_harness() -> void:
 		{"name": "10_jupiter", "jd": _event_jd("1979-07-09"), "mode": ViewMode.SYSTEM,
 			"dist": 14.0, "focus_body": "jupiter", "deselect": true},
 		{"name": "11_saturn", "jd": _event_jd("1981-08-26"), "mode": ViewMode.SYSTEM,
-			"dist": 16.0, "focus_body": "saturn", "deselect": true},
+			"dist": 24.0, "focus_body": "saturn", "deselect": true,
+			"yaw": 0.9, "pitch": 0.42},
+		{"name": "12_earth", "jd": jd_min + 900.0, "mode": ViewMode.SYSTEM,
+			"dist": 3.2, "focus_body": "earth", "deselect": true},
+		{"name": "13_uranus", "jd": _event_jd("1986-01-24"), "mode": ViewMode.SYSTEM,
+			"dist": 14.0, "focus_body": "uranus", "deselect": true},
+		{"name": "14_neptune", "jd": _event_jd("1989-08-25"), "mode": ViewMode.SYSTEM,
+			"dist": 14.0, "focus_body": "neptune", "deselect": true},
 	]
 
 	for st in steps:
