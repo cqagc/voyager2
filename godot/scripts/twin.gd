@@ -12,7 +12,8 @@
 extends Node3D
 
 const AU_UNITS := 10.0
-const PLANET_EXAGGERATION := 300.0
+const PLANET_EXAGGERATION := 620.0
+const SUN_RADIUS := 3.2
 const TRAJECTORY_SAMPLES := 2400
 
 enum ViewMode { SYSTEM, CRAFT }
@@ -43,6 +44,10 @@ var fatal_error := ""
 var system_root: Node3D
 var planet_nodes := {}
 var probe_marker: MeshInstance3D
+var probe_root: Node3D
+var probe_model: Node3D
+var corona: MeshInstance3D
+var sun_light: DirectionalLight3D
 var traveled_mesh: MeshInstance3D
 var camera: Camera3D
 var cam_yaw := 0.6
@@ -94,6 +99,9 @@ var audio_cursor := 0
 var link_line: MeshInstance3D
 var craft_focus := Vector3.ZERO
 var _drag_travel := 0.0
+var _shot_focus_probe := false
+var _shot_focus_sun := false
+var _shot_focus_body := ""
 var _syncing_slider := false
 
 
@@ -125,6 +133,8 @@ func _ready() -> void:
 		_run_dsn_selftest.call_deferred()
 	if "--picktest" in OS.get_cmdline_user_args():
 		_run_pick_selftest.call_deferred()
+	if "--attitudetest" in OS.get_cmdline_user_args():
+		_run_attitude_selftest.call_deferred()
 	print("孪生体就绪：%d 天体，%d 组件，时间跨度 %s .. %s" % [
 		eph.bodies.size(), eph.components.size(),
 		JDTime.format_date_short(jd_min), JDTime.format_date_short(jd_max)])
@@ -137,7 +147,22 @@ func _build_environment() -> void:
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
 	env.ambient_light_color = Color(0.30, 0.32, 0.38)
 	env.ambient_light_energy = 0.55
+	# 辉光：让日面和日冕真正溢出边缘。HDR 阈值调低一点，否则程序化太阳
+	# 的高光进不了 bloom 通道，看起来还是个贴纸。
 	env.glow_enabled = true
+	env.glow_intensity = 0.95
+	# glow_bloom 必须是 0：它给**整幅画面**无条件加辉光，不看阈值。
+	# 早先设成 0.28，结果木星被糊成 (251,245,233) 的白球，条带全被冲掉。
+	# 只有 glow_hdr_threshold 才是「够亮才发光」的那个开关。
+	env.glow_bloom = 0.0
+	env.glow_strength = 1.0
+	env.glow_hdr_threshold = 1.05
+	env.glow_hdr_scale = 2.4
+	env.glow_blend_mode = Environment.GLOW_BLEND_MODE_ADDITIVE
+	for i in 5:
+		env.set("glow_levels/%d" % (i + 1), 1.0 if i < 4 else 0.5)
+	env.tonemap_mode = Environment.TONE_MAPPER_ACES
+	env.tonemap_white = 3.0
 	var we := WorldEnvironment.new()
 	we.environment = env
 	add_child(we)
@@ -153,47 +178,73 @@ func _build_system_view() -> void:
 	system_root.name = "SystemView"
 	add_child(system_root)
 
-	# 太阳。半径不按真实比例 —— 真实比例下它在这个尺度里只有 0.05 单位。
+	# 太阳。半径不按真实比例 —— 真实比例下它在这个尺度里只有 0.05 个单位。
 	var sun := MeshInstance3D.new()
 	var sun_mesh := SphereMesh.new()
-	sun_mesh.radius = 4.0
-	sun_mesh.height = 8.0
+	sun_mesh.radius = SUN_RADIUS
+	sun_mesh.height = SUN_RADIUS * 2.0
+	sun_mesh.radial_segments = 64
+	sun_mesh.rings = 32
 	sun.mesh = sun_mesh
-	var sun_mat := StandardMaterial3D.new()
-	sun_mat.albedo_color = Color(1.0, 0.93, 0.72)
-	sun_mat.emission_enabled = true
-	sun_mat.emission = Color(1.0, 0.88, 0.55)
-	sun_mat.emission_energy_multiplier = 3.0
-	sun_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	sun.mesh.surface_set_material(0, sun_mat)
+	var sun_mat := ShaderMaterial.new()
+	sun_mat.shader = load("res://shaders/sun_surface.gdshader")
+	sun.material_override = sun_mat
 	system_root.add_child(sun)
 
-	var light := OmniLight3D.new()
-	light.light_energy = 3.0
-	light.omni_range = 40000.0
-	system_root.add_child(light)
+	# 日冕与日珥：一块正对相机的公告板，加法混合叠在日面外围。
+	corona = MeshInstance3D.new()
+	var cq := QuadMesh.new()
+	cq.size = Vector2(SUN_RADIUS * 7.0, SUN_RADIUS * 7.0)
+	corona.mesh = cq
+	var cmat := ShaderMaterial.new()
+	cmat.shader = load("res://shaders/sun_corona.gdshader")
+	cmat.set_shader_parameter("disc_radius", SUN_RADIUS / (SUN_RADIUS * 3.5))
+	corona.material_override = cmat
+	corona.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	system_root.add_child(corona)
 
 	for b in eph.bodies:
 		var name_str: String = b["name"]
 		if bool(b["is_spacecraft"]):
 			continue
 		var radius_units := clampf(
-			float(b["mean_radius_km"]) / eph.au_km * AU_UNITS * PLANET_EXAGGERATION, 0.5, 6.0)
+			float(b["mean_radius_km"]) / eph.au_km * AU_UNITS * PLANET_EXAGGERATION, 0.5, 8.0)
 		var node := MeshInstance3D.new()
 		var mesh := SphereMesh.new()
 		mesh.radius = radius_units
 		mesh.height = radius_units * 2.0
 		node.mesh = mesh
-		var mat := StandardMaterial3D.new()
-		mat.albedo_color = PLANET_COLORS.get(name_str, Color(0.7, 0.7, 0.7))
-		node.mesh.surface_set_material(0, mat)
+		mesh.radial_segments = 40
+		mesh.rings = 20
+		var col: Color = PLANET_COLORS.get(name_str, Color(0.7, 0.7, 0.7))
+		var mat := ShaderMaterial.new()
+		mat.shader = load("res://shaders/planet.gdshader")
+		mat.set_shader_parameter("base_color", col)
+		# 气态巨行星给纬向条带，岩质行星只做轻微斑驳。
+		var gas := name_str in ["jupiter", "saturn", "uranus", "neptune"]
+		mat.set_shader_parameter("band_strength", 0.95 if gas else 0.0)
+		# 带纹色调与频率按行星区分：木星条带最密最强，天王星几乎没有。
+		match name_str:
+			"jupiter":
+				mat.set_shader_parameter("band_tint", Color(0.62, 0.38, 0.24))
+				mat.set_shader_parameter("band_freq", 11.0)
+			"saturn":
+				mat.set_shader_parameter("band_tint", Color(0.72, 0.56, 0.34))
+				mat.set_shader_parameter("band_freq", 8.0)
+			"uranus":
+				mat.set_shader_parameter("band_tint", Color(0.66, 0.86, 0.90))
+				mat.set_shader_parameter("band_freq", 4.0)
+			"neptune":
+				mat.set_shader_parameter("band_tint", Color(0.30, 0.42, 0.78))
+				mat.set_shader_parameter("band_freq", 6.0)
+		node.material_override = mat
 		node.name = name_str
 		system_root.add_child(node)
 		planet_nodes[name_str] = node
 
 		if name_str in ORBIT_BODIES:
 			system_root.add_child(_build_path_mesh(name_str, jd_min, jd_max,
-				Color(mat.albedo_color, 0.45), 600))
+				Color(col, 0.45), 600))
 
 	# Voyager 2 的完整航迹。
 	system_root.add_child(_build_path_mesh("voyager2", jd_min, jd_max,
@@ -209,19 +260,60 @@ func _build_system_view() -> void:
 	link_line.mesh = ImmediateMesh.new()
 	system_root.add_child(link_line)
 
+	# 探测器用真实模型，不用色点。
+	#
+	# 尺度必须夸张：真机约 13 m，在 1 AU = 10 单位的尺度下是 8.7e-10 个单位,
+	# 按真实比例渲染就是不存在。所以随相机距离等比放大，并在面板上注明这是
+	# 示意尺寸。这跟行星的处理是一致的。
+	probe_root = Node3D.new()
+	probe_root.name = "Voyager2Probe"
+	system_root.add_child(probe_root)
+
+	# 太阳光。
+	#
+	# 行星走的是自照明 shader（unshaded），不吃场景灯光；但探测器模型用的是
+	# glTF 自带的 StandardMaterial3D，没有光源就是一团黑 —— 删掉 OmniLight
+	# 之后正是如此。这里补一盏平行光，每帧把方向对准「从太阳射向探测器」，
+	# 于是探测器的受光面朝向太阳，和真实情形一致。
+	# 用平行光而不是点光源，就是为了绕开距离衰减：140 AU 外任何点光源都归零。
+	sun_light = DirectionalLight3D.new()
+	sun_light.light_energy = 1.25
+	sun_light.light_color = Color(1.0, 0.96, 0.88)
+	sun_light.shadow_enabled = false
+	system_root.add_child(sun_light)
+
+	var probe_glb := load("res://assets/Voyager2_rigged.glb")
+	if probe_glb != null:
+		probe_model = probe_glb.instantiate()
+		probe_root.add_child(probe_model)
+		# 太阳系视图里探测器很小，关掉阴影省开销。
+		for n in _all_meshes(probe_model):
+			n.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+
+	# 模型自带材质在远处会糊成一团，补一圈加法光晕便于定位。
 	probe_marker = MeshInstance3D.new()
-	var pm := SphereMesh.new()
-	pm.radius = 3.0
-	pm.height = 6.0
-	probe_marker.mesh = pm
-	var pmat := StandardMaterial3D.new()
-	pmat.albedo_color = Color(1.0, 0.35, 0.20)
-	pmat.emission_enabled = true
-	pmat.emission = Color(1.0, 0.40, 0.20)
-	pmat.emission_energy_multiplier = 2.5
-	pmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	probe_marker.mesh.surface_set_material(0, pmat)
-	system_root.add_child(probe_marker)
+	var halo := QuadMesh.new()
+	halo.size = Vector2(6.0, 6.0)
+	probe_marker.mesh = halo
+	var hmat := ShaderMaterial.new()
+	hmat.shader = load("res://shaders/sun_corona.gdshader")
+	hmat.set_shader_parameter("corona_color", Color(1.0, 0.42, 0.16))
+	hmat.set_shader_parameter("prom_color", Color(1.0, 0.62, 0.30))
+	hmat.set_shader_parameter("corona_falloff", 4.5)
+	hmat.set_shader_parameter("prom_strength", 0.0)
+	hmat.set_shader_parameter("disc_radius", 0.06)
+	probe_marker.material_override = hmat
+	probe_marker.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	probe_root.add_child(probe_marker)
+
+
+func _all_meshes(node: Node) -> Array:
+	var out := []
+	if node is MeshInstance3D:
+		out.append(node)
+	for c in node.get_children():
+		out.append_array(_all_meshes(c))
+	return out
 
 
 func _build_path_mesh(body: String, from_jd: float, to_jd: float, color: Color, samples: int) -> MeshInstance3D:
@@ -562,8 +654,10 @@ func _refresh() -> void:
 		planet_nodes[name_str].position = _to_units(st["pos"])
 		planet_nodes[name_str].visible = st["in_range"]
 
-	probe_marker.position = _to_units(probe["pos"])
-	probe_marker.visible = in_range
+	probe_root.position = _to_units(probe["pos"])
+	probe_root.visible = in_range
+	_orient_probe(probe, earth)
+	_aim_sun_light()
 	_scale_markers()
 	_rebuild_traveled()
 	_rebuild_link_line(probe, earth)
@@ -675,7 +769,63 @@ func _scale_markers() -> void:
 	var k := maxf(1.0, cam_dist * 0.0016)
 	for n in planet_nodes:
 		planet_nodes[n].scale = Vector3.ONE * k
-	probe_marker.scale = Vector3.ONE * maxf(1.0, cam_dist * 0.0012)
+	# 探测器的缩放：近处固定世界尺寸，远处才按距离放大。
+	#
+	# 早先做成了纯粹的「恒定视角大小」（scale ∝ cam_dist），后果是无论怎么
+	# 放大它都只占屏幕 4% —— **永远凑不近看**。对一个数字孪生来说这是错的，
+	# 拉近检视本来就是核心操作。
+	#
+	# 现在：pk = max(近处固定值, cam_dist × 系数)
+	#   近处 —— 固定 1.1。基准要看**碟面**（直径 3.8）而不是整机跨度 17，
+	#           因为那 17 里有 15 米是几乎看不见的磁强计桁架。1.1 让碟面到
+	#           4.2 个单位，cam_dist 14 时占屏高约 20%，推到最近会充满画面。
+	#   远处 —— 按 0.0011·d 放大以免消失，上限 5.0。
+	#
+	# 这个远处系数是压过一次的：早先取 0.016，结果在木星飞掠的视距上探测器
+	# 的碟面有 9.7 个单位、而木星直径只有 3.7 —— 探测器比木星还大，荒谬。
+	# 两者的夸张倍数本来就天差地别（行星约 620 倍，探测器约 4 亿倍），
+	# 没有诚实的可比性，但至少不能让人看出「探测器比行星大」这种反直觉画面。
+	var pk := clampf(maxf(1.10, cam_dist * 0.0011), 1.10, 5.0)
+	if probe_model != null:
+		probe_model.scale = Vector3.ONE * pk
+	# 光晕只是**远距离的定位提示**：拉远时它是唯一能让人找到探测器的线索，
+	# 但凑近时必须让路 —— 加法混合的光晕会把模型本身糊成一团发光的球。
+	var halo_on := cam_dist > 140.0
+	probe_marker.visible = halo_on
+	if halo_on:
+		probe_marker.scale = Vector3.ONE * clampf(cam_dist * 0.0075, 1.0, 46.0)
+
+
+## 平行光方向 = 从太阳射向探测器。
+func _aim_sun_light() -> void:
+	if sun_light == null:
+		return
+	var d := probe_root.position
+	if d.length() < 1e-5:
+		return
+	sun_light.look_at_from_position(Vector3.ZERO, d, Vector3.UP)
+
+
+## 让高增益天线指向地球。
+##
+## 这不是随手摆的姿态：Voyager 2 的姿态控制律就是把高增益天线保持对地指向
+## ——否则 19 小时外的下行链路根本建立不起来。模型在 glTF 里以 Y-up 导出，
+## 碟面法向落在 +Y，所以要构造一个把 +Y 对准地球方向的基。
+func _orient_probe(probe: Dictionary, earth: Dictionary) -> void:
+	if probe_model == null or not bool(probe["in_range"]) or not bool(earth["in_range"]):
+		return
+	var to_earth := (_to_units(earth["pos"]) - _to_units(probe["pos"]))
+	if to_earth.length() < 1e-6:
+		return
+	var y_axis := to_earth.normalized()
+	# 取一个跟指向不共线的参考轴来定滚转。滚转本身在公开数据里没有，
+	# 这里只保证天线指向正确，不假装知道滚转角。
+	var ref := Vector3(0, 0, 1)
+	if absf(y_axis.dot(ref)) > 0.98:
+		ref = Vector3(1, 0, 0)
+	var x_axis := ref.cross(y_axis).normalized()
+	var z_axis := x_axis.cross(y_axis)
+	probe_root.basis = Basis(x_axis, y_axis, z_axis)
 
 
 ## 探测器↔地球连线。DSN 的上下行就走这条路径。
@@ -718,7 +868,13 @@ func _update_camera() -> void:
 		_scale_markers()
 	var target := craft_focus
 	if mode == ViewMode.SYSTEM:
-		target = probe_marker.position * 0.35
+		target = probe_root.position * 0.35
+		if _shot_focus_probe:
+			target = probe_root.position
+		elif _shot_focus_sun:
+			target = Vector3.ZERO
+		elif _shot_focus_body != "" and planet_nodes.has(_shot_focus_body):
+			target = planet_nodes[_shot_focus_body].position
 	var dir := Vector3(
 		cos(cam_pitch) * sin(cam_yaw), sin(cam_pitch), cos(cam_pitch) * cos(cam_yaw))
 	camera.position = target + dir * cam_dist
@@ -1012,12 +1168,27 @@ func _run_screenshot_harness() -> void:
 			"select": "RTG_2", "yaw": 1.9, "pitch": 0.15},
 		{"name": "07_golden_record", "jd": jd_max, "mode": ViewMode.CRAFT, "dist": 1.1,
 			"select": "GoldenRecord"},
+		{"name": "08_sun", "jd": _event_jd("1979-07-09"), "mode": ViewMode.SYSTEM,
+			"dist": 16.0, "focus_sun": true, "deselect": true},
+		{"name": "09_probe_closeup", "jd": _event_jd("1989-08-25"), "mode": ViewMode.SYSTEM,
+			"dist": 14.0, "focus_probe": true, "deselect": true},
+		{"name": "10_jupiter", "jd": _event_jd("1979-07-09"), "mode": ViewMode.SYSTEM,
+			"dist": 14.0, "focus_body": "jupiter", "deselect": true},
+		{"name": "11_saturn", "jd": _event_jd("1981-08-26"), "mode": ViewMode.SYSTEM,
+			"dist": 16.0, "focus_body": "saturn", "deselect": true},
 	]
 
 	for st in steps:
 		_seek(float(st["jd"]))
 		_set_mode(st["mode"])
 		cam_dist = float(st["dist"])
+		_shot_focus_probe = st.has("focus_probe")
+		_shot_focus_sun = st.has("focus_sun")
+		_shot_focus_body = String(st.get("focus_body", ""))
+		if st.has("deselect"):
+			selected_component = ""
+			record_panel.visible = false
+			record_spinning = false
 		if st.has("yaw"):
 			cam_yaw = float(st["yaw"])
 		if st.has("pitch"):
@@ -1127,4 +1298,27 @@ func _run_pick_selftest() -> void:
 	for line in report:
 		print(line)
 	print("PICKTEST_DONE pass=%d fail=%d" % [pass_n, fail_n])
+	get_tree().quit()
+
+
+## 姿态自检：验证高增益天线确实指向地球。
+##
+## 不靠肉眼看渲染图判断朝向 —— 碟面在斜视角下是个椭圆，正对和偏 30 度
+## 看起来差不多。模型经 glTF 以 Y-up 导出，碟面法向落在 +Y，所以直接量
+## probe_root 的 +Y 轴与「探测器→地球」方向的夹角，应当恒为 0。
+func _run_attitude_selftest() -> void:
+	_set_mode(ViewMode.SYSTEM)
+	var worst := 0.0
+	var checks := [jd_min + 30.0, _event_jd("1979-07-09"), _event_jd("1989-08-25"),
+		(jd_min + jd_max) * 0.5, jd_max]
+	for jd in checks:
+		_seek(jd)
+		var probe := eph.state_at("voyager2", jd)
+		var earth := eph.state_at("earth", jd)
+		var want := (_to_units(earth["pos"]) - _to_units(probe["pos"])).normalized()
+		var got: Vector3 = probe_root.basis.y.normalized()
+		var deg := rad_to_deg(acos(clampf(got.dot(want), -1.0, 1.0)))
+		worst = maxf(worst, deg)
+		print("ATTITUDE %s  天线轴与对地方向夹角 %.4f°" % [JDTime.format_date_short(jd), deg])
+	print("ATTITUDE_DONE 最大偏差 %.4f° %s" % [worst, "OK" if worst < 0.01 else "FAIL"])
 	get_tree().quit()
