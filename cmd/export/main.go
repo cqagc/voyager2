@@ -103,6 +103,8 @@ type SatelliteElements struct {
 	PeriodDays   float64 `json:"period_days"`
 	EpochJD      float64 `json:"epoch_jd"`
 	MeanRadiusKm float64 `json:"mean_radius_km"`
+	// Frame is "ecliptic" or "laplace" -- see internal/orbit.
+	Frame string `json:"frame"`
 	// PhaseTrustworthy is false for every satellite here, recorded explicitly
 	// so the front end cannot assume otherwise by omission.
 	PhaseTrustworthy bool `json:"phase_trustworthy"`
@@ -329,6 +331,7 @@ func satelliteElements() []SatelliteElements {
 			ArgPeriDeg: e.ArgPeriDeg, NodeDeg: e.NodeDeg,
 			MeanAnomDeg: e.MeanAnomDeg, PeriodDays: e.PeriodDays,
 			EpochJD: orbit.J2000, MeanRadiusKm: e.MeanRadiusKm,
+			Frame:            e.Frame,
 			PhaseTrustworthy: false,
 		})
 	}

@@ -61,6 +61,20 @@ type Elements struct {
 	MeanRadiusKm float64
 	// Label is the human-facing name.
 	Label string
+	// Frame names the plane the angular elements are referred to.
+	//
+	// This matters and getting it wrong is visible: the Moon's classic mean
+	// elements are referred to the ECLIPTIC, but treating them as Earth-
+	// equatorial and applying the 23.44 deg obliquity rotation tilts the whole
+	// orbit by that much. Measured against real ephemeris, the orbit-plane
+	// normal was off by 16-26 deg with the rotation applied and 0.14 deg
+	// without it at J2000 (see TestMoonOrbitPlaneFrame). The drawn ring then
+	// misses the Moon entirely, which is exactly what a user reported.
+	//
+	// "ecliptic" -> angles already in ecliptic J2000, apply no tilt.
+	// "laplace"  -> approximate the local Laplace plane by the parent's
+	//               equator, i.e. tilt by the parent's obliquity.
+	Frame string
 }
 
 // Satellites are the moons this project renders.
@@ -71,49 +85,49 @@ type Elements struct {
 // which agree to within 0.5% (see TestPeriodsAgreeWithTwoBodyDerivation).
 var Satellites = []Elements{
 	{
-		Name: "moon", Parent: "earth", Label: "月球",
+		Name: "moon", Parent: "earth", Label: "月球", Frame: "ecliptic",
 		SemiMajorKm: 384399, Ecc: 0.0549, IncDeg: 5.145,
 		ArgPeriDeg: 318.15, NodeDeg: 125.08, MeanAnomDeg: 135.27,
 		PeriodDays: 27.321582, MeanRadiusKm: 1737.4,
 	},
 	{
-		Name: "io", Parent: "jupiter", Label: "木卫一",
+		Name: "io", Frame: "laplace", Parent: "jupiter", Label: "木卫一",
 		SemiMajorKm: 421800, Ecc: 0.004, IncDeg: 0.0,
 		ArgPeriDeg: 49.1, NodeDeg: 0.0, MeanAnomDeg: 330.9,
 		PeriodDays: 1.769300, MeanRadiusKm: 1821.6,
 	},
 	{
-		Name: "europa", Parent: "jupiter", Label: "木卫二",
+		Name: "europa", Frame: "laplace", Parent: "jupiter", Label: "木卫二",
 		SemiMajorKm: 671100, Ecc: 0.009, IncDeg: 0.5,
 		ArgPeriDeg: 45.0, NodeDeg: 184.0, MeanAnomDeg: 345.4,
 		PeriodDays: 3.550400, MeanRadiusKm: 1560.8,
 	},
 	{
-		Name: "ganymede", Parent: "jupiter", Label: "木卫三",
+		Name: "ganymede", Frame: "laplace", Parent: "jupiter", Label: "木卫三",
 		SemiMajorKm: 1070400, Ecc: 0.001, IncDeg: 0.2,
 		ArgPeriDeg: 198.3, NodeDeg: 58.5, MeanAnomDeg: 324.8,
 		PeriodDays: 7.155600, MeanRadiusKm: 2634.1,
 	},
 	{
-		Name: "callisto", Parent: "jupiter", Label: "木卫四",
+		Name: "callisto", Frame: "laplace", Parent: "jupiter", Label: "木卫四",
 		SemiMajorKm: 1882700, Ecc: 0.007, IncDeg: 0.3,
 		ArgPeriDeg: 43.8, NodeDeg: 309.1, MeanAnomDeg: 87.4,
 		PeriodDays: 16.690000, MeanRadiusKm: 2410.3,
 	},
 	{
-		Name: "titan", Parent: "saturn", Label: "土卫六",
+		Name: "titan", Frame: "laplace", Parent: "saturn", Label: "土卫六",
 		SemiMajorKm: 1221900, Ecc: 0.029, IncDeg: 0.3,
 		ArgPeriDeg: 78.3, NodeDeg: 78.6, MeanAnomDeg: 11.7,
 		PeriodDays: 15.945000, MeanRadiusKm: 2574.7,
 	},
 	{
-		Name: "miranda", Parent: "uranus", Label: "天卫五",
+		Name: "miranda", Frame: "laplace", Parent: "uranus", Label: "天卫五",
 		SemiMajorKm: 129846, Ecc: 0.001, IncDeg: 4.4,
 		ArgPeriDeg: 154.8, NodeDeg: 100.9, MeanAnomDeg: 73.0,
 		PeriodDays: 1.413000, MeanRadiusKm: 235.8,
 	},
 	{
-		Name: "triton", Parent: "neptune", Label: "海卫一",
+		Name: "triton", Frame: "laplace", Parent: "neptune", Label: "海卫一",
 		SemiMajorKm: 354800, Ecc: 0.000, IncDeg: 157.3,
 		ArgPeriDeg: 0.0, NodeDeg: 178.1, MeanAnomDeg: 63.0,
 		PeriodDays: 5.877000, MeanRadiusKm: 1353.4,
@@ -208,6 +222,10 @@ func (e Elements) PositionParentFrame(jd float64) domain.Vec3 {
 // visualisation needs.
 func (e Elements) PositionEclipticOffset(jd float64, parentObliquityDeg float64) domain.Vec3 {
 	p := e.PositionParentFrame(jd)
+	// Elements already referred to the ecliptic need no tilt.
+	if e.Frame == "ecliptic" {
+		parentObliquityDeg = 0
+	}
 	t := deg2rad(parentObliquityDeg)
 	ct, st := math.Cos(t), math.Sin(t)
 	return domain.Vec3{

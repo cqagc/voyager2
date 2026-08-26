@@ -80,6 +80,9 @@ var planet_tilt := {}
 var body_real_radius := {}
 var satellite_orbits := {}
 var _satellite_allowed := {}
+var _orbit_built_jd := {}
+var _orbit_from_ephemeris := {}
+var _orbit_points := {}
 ## 各天体因「屏幕最小尺寸下限」被额外撑大的倍数。1.0 表示比例真实。
 var _size_inflation := {}
 var saturn_rings: MeshInstance3D
@@ -181,6 +184,8 @@ func _ready() -> void:
 		_run_attitude_selftest.call_deferred()
 	if "--orbittest" in OS.get_cmdline_user_args():
 		_run_orbit_selftest.call_deferred()
+	if "--ringtest" in OS.get_cmdline_user_args():
+		_run_ring_selftest.call_deferred()
 	if "--scaletest" in OS.get_cmdline_user_args():
 		_run_scale_selftest.call_deferred()
 	if "--focustest" in OS.get_cmdline_user_args():
@@ -279,7 +284,7 @@ func _build_system_view() -> void:
 		if not planet_nodes.has(parent):
 			continue
 		_build_body(b, planet_nodes[parent])
-		_build_satellite_orbit(nm, parent)
+		_rebuild_satellite_orbit(nm)
 
 	# 探测器↔地球连线：这就是 DSN 上下行走的那条路径。
 	link_line = MeshInstance3D.new()
@@ -560,29 +565,58 @@ func _build_ring_system(nm: String, prof: Dictionary, planet_radius_units: float
 	return mi
 
 
-## 卫星轨道环。用 Go 侧导出的开普勒要素画一圈。
+## 卫星轨道环。
 ##
-## 只画轨道**不定位置** —— internal/orbit 的测试量过，这套要素在飞掠时刻的
-## 相位误差是半长轴的 19%–200%（因为飞掠离 J2000 曆元 11–21 年）。轨道的
-## 尺寸和轨道面是准的（对照星历误差 0.00%–0.74%），相位不是。
-func _build_satellite_orbit(nm: String, parent: String) -> void:
-	var e: Dictionary = eph.satellites[nm]
-	var obl := float(eph.profiles.get(parent, {}).get("obliquity_deg", 0.0))
-	var period := float(e["period_days"])
+## **采样充分时直接用星历画**，而不是用开普勒要素。
+##
+## 为什么：要素是固定曆元（J2000）的，抓不住轨道面进动。月球的交点退行周期
+## 18.6 年，实测轨道面法向在 1977 和 2026 与星历相差 6-10 度 —— 环和天体明显
+## 错开，用户一眼就看出「月球不在轨道上」。用星历画则精确、自带进动、而且
+## **必然与天体的绘制位置一致**（同一个数据源）。
+##
+## 采样不足的卫星（木卫一 1.77 天一圈，日采样连半个样本都不到）退回要素，
+## 因为那时星历本身就是混叠的 —— 此时天体本体也被隐藏，只留环示意。
+func _rebuild_satellite_orbit(nm: String) -> void:
+	var parent := String(eph.satellites[nm]["parent"])
+	if not planet_nodes.has(parent):
+		return
+	var period := float(eph.satellites[nm]["period_days"])
 	var n := 220
 	var pts := PackedVector3Array()
-	# 真实比例：不再乘任何放大倍数。
 	var s := AU_UNITS / eph.au_km
-	for i in n:
-		var jd := float(e["epoch_jd"]) + period * float(i) / float(n - 1)
-		var off: Array = eph.satellite_offset_km(nm, jd, obl)
-		# 先在 double 里缩放到场景单位，再落到 Vector3。
-		pts.append(Vector3(float(off[0]) * s, float(off[2]) * s, -float(off[1]) * s))
+	var from_ephemeris: bool = eph.satellite_position_is_resolved(nm, jd_now)
+
+	if from_ephemeris:
+		# 以当前时刻为中心取一整个周期。
+		for i in n:
+			var jd := jd_now + period * (float(i) / float(n - 1) - 0.5)
+			var ms := eph.state_at(nm, jd)
+			var ps := eph.state_at(parent, jd)
+			var dx := float(ms["pos"][0]) - float(ps["pos"][0])
+			var dy := float(ms["pos"][1]) - float(ps["pos"][1])
+			var dz := float(ms["pos"][2]) - float(ps["pos"][2])
+			pts.append(Vector3(dx * s, dz * s, -dy * s))
+	else:
+		var obl := float(eph.profiles.get(parent, {}).get("obliquity_deg", 0.0))
+		for i in n:
+			var jd2 := float(eph.satellites[nm]["epoch_jd"]) + period * float(i) / float(n - 1)
+			var off: Array = eph.satellite_offset_km(nm, jd2, obl)
+			pts.append(Vector3(float(off[0]) * s, float(off[2]) * s, -float(off[1]) * s))
+
+	if satellite_orbits.has(nm) and is_instance_valid(satellite_orbits[nm]):
+		(satellite_orbits[nm] as Node3D).queue_free()
+	# 星历画的环用实线冷色，要素推的环用更暗的紫色 —— 一眼能区分
+	# 「这条是实测轨迹」还是「这条只是要素示意」。
 	var mi := _build_ribbon(pts, 0.0007,
-		Color(0.30, 0.70, 0.85), Color(0.55, 0.45, 0.90), 0.30, 1.0)
+		Color(0.30, 0.80, 0.95) if from_ephemeris else Color(0.42, 0.30, 0.62),
+		Color(0.55, 0.55, 0.95) if from_ephemeris else Color(0.30, 0.22, 0.48),
+		0.34 if from_ephemeris else 0.20, 1.0)
 	mi.name = nm + "_orbit"
 	planet_nodes[parent].add_child(mi)
 	satellite_orbits[nm] = mi
+	_orbit_built_jd[nm] = jd_now
+	_orbit_from_ephemeris[nm] = from_ephemeris
+	_orbit_points[nm] = pts
 
 
 func _build_path_mesh(body: String, from_jd: float, to_jd: float,
@@ -851,7 +885,7 @@ func _build_ui() -> void:
 			continue
 		var parent_label := String(eph.body_by_name.get(
 			String(eph.satellites[nm2]["parent"]), {}).get("label", ""))
-		btn_focus.add_item("    %s · %s" % [parent_label, String(b["label"])])
+		btn_focus.add_item("  └ %s（%s 的卫星）" % [String(b["label"]), parent_label])
 		btn_focus.set_item_metadata(btn_focus.item_count - 1, nm2)
 	btn_focus.item_selected.connect(func(i: int) -> void:
 		_set_focus(String(btn_focus.get_item_metadata(i))))
@@ -950,6 +984,7 @@ func _refresh() -> void:
 		var pv: Node3D = planet_nodes[name_str]
 		if eph.satellites.has(name_str):
 			_place_satellite(name_str, pv)
+			_maybe_refresh_orbit(name_str)
 		else:
 			var st := eph.state_at(name_str, jd_now)
 			pv.position = _to_units(st["pos"])
@@ -997,6 +1032,12 @@ func _refresh() -> void:
 		lines.append("[color=#5f9e6f]轨迹数据：归档实测 + Hermite 插值[/color]")
 	else:
 		lines.append("[color=#b06060]该时刻超出星历覆盖范围[/color]")
+	lines.append("[color=#8fa3bf]相机锁定[/color]  %s" % _focus_label())
+	if eph.satellites.has(focus_target):
+		var src_ok: bool = bool(_orbit_from_ephemeris.get(focus_target, false))
+		lines.append("  轨道环数据源：%s" % (
+			"[color=#5f9e6f]归档星历（精确，含轨道面进动）[/color]" if src_ok
+			else "[color=#d98a3a]开普勒要素示意（相位不可信）[/color]"))
 	if focus_note != "":
 		lines.append("[color=#d98a3a]%s[/color]" % focus_note)
 	lbl_readout.text = "\n".join(lines)
@@ -1217,6 +1258,21 @@ func _place_satellite(nm: String, pivot: Node3D) -> void:
 	pivot.position = Vector3(dx * s, dz * s, -dy * s)
 
 
+## 时间走动或数据可用性变化时，按需重建卫星轨道环。
+##
+## 不每帧重建：一条环 220 个采样点、每点两次星历查询，8 颗卫星每帧重建会
+## 明显掉帧。只在时间移动超过周期的 5%、或者数据来源发生切换时才重建。
+func _maybe_refresh_orbit(nm: String) -> void:
+	if not _satellite_allowed.get(nm, false):
+		return
+	var period := float(eph.satellites[nm]["period_days"])
+	var last: float = float(_orbit_built_jd.get(nm, -1.0e18))
+	var resolved: bool = eph.satellite_position_is_resolved(nm, jd_now)
+	var source_changed: bool = bool(_orbit_from_ephemeris.get(nm, false)) != resolved
+	if source_changed or absf(jd_now - last) > period * 0.05:
+		_rebuild_satellite_orbit(nm)
+
+
 ## 天体自转。
 ##
 ## 自转**速率**用真实的恒星自转周期（NASA Planetary Fact Sheet），负号为逆行
@@ -1330,6 +1386,20 @@ func _update_camera() -> void:
 	# 内容。行星系统视图里看不到整条航迹，这是可接受的取舍。
 	camera.near = clampf(cam_dist * 0.01, 1.0e-5, 20.0)
 	camera.far = camera.near * 8.0e4
+
+
+## 当前锁定目标的人类可读名字，外加它是否真的被对准。
+func _focus_label() -> String:
+	if focus_target == "":
+		return "太阳"
+	if focus_target == "voyager2":
+		return "旅行者 2 号（跟随）"
+	var label := String(eph.body_by_name.get(focus_target, {}).get("label", focus_target))
+	if planet_nodes.has(focus_target) and not (planet_nodes[focus_target] as Node3D).visible:
+		var parent := String(eph.satellites.get(focus_target, {}).get("parent", ""))
+		var pl := String(eph.body_by_name.get(parent, {}).get("label", parent))
+		return "%s [color=#b06060]（此刻不可定位，已回退到 %s）[/color]" % [label, pl]
+	return label
 
 
 ## 当前相机锁定的目标位置。
@@ -2030,10 +2100,68 @@ func _run_focus_selftest() -> void:
 		var err := (looking_at - want).length()
 		# 误差按相机距离归一（同样的绝对误差在近景是灾难、在远景无所谓）
 		var rel := err / maxf(cam_dist, 1e-9)
-		var ok := rel < 0.02
+		# 聚焦目标必须可见 —— 不可见时 _focus_position 会回退到母星，
+		# 表现就是「锁定月球却对准了地球」。
+		var vis := true
+		if meta != "" and meta != "voyager2" and planet_nodes.has(meta):
+			vis = (planet_nodes[meta] as Node3D).visible
+		var ok := rel < 0.02 and vis
 		if not ok:
 			fails += 1
-		print("FOCUSTEST %-22s meta=%-10s 目标=%-10s 距离=%10.5f 偏差=%s  %s" % [
-			label.strip_edges(), meta, what, cam_dist, JDTime.sci(rel), "OK" if ok else "FAIL"])
+		print("FOCUSTEST %-22s meta=%-10s 目标=%-10s 距离=%10.5f 偏差=%s 可见=%s  %s" % [
+			label.strip_edges(), meta, what, cam_dist, JDTime.sci(rel), str(vis),
+			"OK" if ok else "FAIL"])
 	print("FOCUSTEST_DONE 项数 %d 失败 %d" % [btn_focus.item_count, fails])
+	get_tree().quit()
+
+
+## 轨道环自检：卫星本体必须**落在**它自己画出的环上。
+##
+## 这条自检是补的，因为它本该拦住一个用户发现的 bug：月球的开普勒要素是
+## 黄道系的，我却当成地球赤道系套了 23.44 度的倾角旋转，把环整体歪掉，
+## 月球明显不在环上。实测轨道面法向偏差 16-26 度。
+##
+## 截图自检看不出这种问题 —— 画面上环也在、天体也在，只是位置不对。
+##   Godot --path . -- --ringtest
+func _run_ring_selftest() -> void:
+	_set_mode(ViewMode.SYSTEM)
+	var epoch_for := {
+		"moon": jd_min + 3000.0,
+		"io": _event_jd("1979-07-09"), "europa": _event_jd("1979-07-09"),
+		"ganymede": _event_jd("1979-07-09"), "callisto": _event_jd("1979-07-09"),
+		"titan": _event_jd("1981-08-26"), "miranda": _event_jd("1986-01-24"),
+		"triton": _event_jd("1989-08-25"),
+	}
+	var fails := 0
+	for nm in eph.satellites:
+		var parent := String(eph.satellites[nm]["parent"])
+		_seek(float(epoch_for.get(nm, jd_now)))
+		_set_focus(parent)
+		await get_tree().process_frame
+		_refresh()
+		var pv: Node3D = planet_nodes[nm]
+		if not pv.visible or not _orbit_points.has(nm):
+			print("RINGTEST %-9s 跳过（此刻不可见）" % nm)
+			continue
+		# 天体在母星局部坐标系里的位置
+		var local := pv.position
+		# 到环折线的最短距离
+		var pts: PackedVector3Array = _orbit_points[nm]
+		var best := INF
+		for i in pts.size() - 1:
+			var a := pts[i]
+			var b := pts[i + 1]
+			var ab := b - a
+			var l2 := ab.length_squared()
+			var t := 0.0 if l2 < 1e-24 else clampf((local - a).dot(ab) / l2, 0.0, 1.0)
+			best = minf(best, (local - (a + ab * t)).length())
+		var a_units := float(eph.satellites[nm]["semi_major_km"]) / eph.au_km * AU_UNITS
+		var rel := best / maxf(a_units, 1e-12)
+		var src := "星历" if bool(_orbit_from_ephemeris.get(nm, false)) else "要素"
+		var ok := rel < 0.06
+		if not ok:
+			fails += 1
+		print("RINGTEST %-9s 环源=%s  离环 %s 单位 = %5.2f%% 半长轴  %s" % [
+			nm, src, JDTime.sci(best), rel * 100.0, "OK" if ok else "FAIL 天体不在环上"])
+	print("RINGTEST_DONE 失败 %d" % fails)
 	get_tree().quit()

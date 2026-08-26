@@ -297,6 +297,10 @@ func satellite_offset_km(body_name: String, jd: float, parent_obliquity_deg: flo
 	var py := x1 * sin(om) + y2 * cos(om)
 	var pz := z2
 
-	# 母星赤道面 -> 黄道 J2000
+	# 母星赤道面 -> 黄道 J2000。
+	# 已在黄道系里给出的要素（月球）不需要这一步旋转 —— 套上去会把整个
+	# 轨道面歪掉 23.44 度，实测轨道面法向偏差 16-26 度，环直接错开天体。
+	if String(e.get("frame", "laplace")) == "ecliptic":
+		parent_obliquity_deg = 0.0
 	var t := deg_to_rad(parent_obliquity_deg)
 	return [px, py * cos(t) - pz * sin(t), py * sin(t) + pz * cos(t)]
