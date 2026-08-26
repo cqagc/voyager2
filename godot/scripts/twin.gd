@@ -12,7 +12,33 @@
 extends Node3D
 
 const AU_UNITS := 10.0
-const PLANET_EXAGGERATION := 620.0
+## 行星半径的夸张倍数是**随相机距离变化**的，不是常数。
+##
+## 为什么必须这样：场景里 1 AU = 10 个单位，而地球半径只有 0.000426 个单位。
+## 拉远看太阳系时必须把行星放大上千倍才看得见；但一旦要看卫星系统，同样的
+## 倍数就会把内部几何彻底摧毁 —— 早先我用行星的夸张倍数去放大卫星轨道，
+## 结果月球被甩到地球公转轨道的 3 倍远（用户一眼看出「离婚了」），木卫四的
+## 轨道比木星自己的公转轨道还宽。
+##
+## 现在：远处大幅放大（看得见行星），近处退回接近真实比例（卫星系统的比例
+## 才正确）。在对数空间插值。卫星轨道**一律真实比例，不再放大**。
+const EXA_NEAR_DIST := 0.35     # 这个距离及更近 => 倍数 EXA_MIN
+## 近处的放大倍数不取 1（真实比例）而取 6，这是一个刻意的、有代价的折中。
+##
+## 真实比例下地球只有月球轨道半径的 1/60：取景框住月球轨道时，地球就是
+## 十几个像素、月球是三个像素。技术上正确，看着毫无意义。
+##
+## 关键是行星和它的卫星按**同一个倍数**放大，所以两者的**相对大小仍然真实**
+## （月球/地球半径 = 0.273，渲染出来还是 0.273）。被压缩的只有「轨道半径 /
+## 天体半径」这一个比值，从 60 变成 10。
+##
+## 这和之前那个 bug 是两码事：那次是把月球轨道本身放大了 1173 倍，甩到地球
+## 公转轨道的 3 倍远。现在轨道是真实尺度，只有天体被等比放大。
+const EXA_MIN := 6.0
+## 卫星系统的取景距离落在 0.006–0.25 之间，所以阈值必须高于这个区间，
+## 否则锁定行星后卫星系统的内部比例仍然是被压缩的。
+const EXA_FAR_DIST := 400.0     # 这个距离及更远 => 倍数 EXA_MAX
+const EXA_MAX := 2000.0
 const SUN_RADIUS := 3.2
 
 ## 与 planet.gdshader 里的 kind 分支一一对应。
@@ -50,8 +76,12 @@ var fatal_error := ""
 var system_root: Node3D
 var planet_nodes := {}
 var planet_spin := {}
-var body_magnify := {}
+var planet_tilt := {}
+var body_real_radius := {}
 var satellite_orbits := {}
+var _satellite_allowed := {}
+## 各天体因「屏幕最小尺寸下限」被额外撑大的倍数。1.0 表示比例真实。
+var _size_inflation := {}
 var saturn_rings: MeshInstance3D
 var probe_marker: MeshInstance3D
 var probe_root: Node3D
@@ -115,6 +145,7 @@ var _shot_focus_body := ""
 ## 相机锁定目标："" = 太阳，"voyager2" = 跟随探测器，其余为天体名。
 var focus_target := ""
 var btn_focus: OptionButton
+var focus_note := ""
 var _syncing_slider := false
 
 
@@ -150,6 +181,10 @@ func _ready() -> void:
 		_run_attitude_selftest.call_deferred()
 	if "--orbittest" in OS.get_cmdline_user_args():
 		_run_orbit_selftest.call_deferred()
+	if "--scaletest" in OS.get_cmdline_user_args():
+		_run_scale_selftest.call_deferred()
+	if "--focustest" in OS.get_cmdline_user_args():
+		_run_focus_selftest.call_deferred()
 	print("孪生体就绪：%d 天体，%d 组件，时间跨度 %s .. %s" % [
 		eph.bodies.size(), eph.components.size(),
 		JDTime.format_date_short(jd_min), JDTime.format_date_short(jd_max)])
@@ -183,6 +218,12 @@ func _build_environment() -> void:
 	add_child(we)
 
 	camera = Camera3D.new()
+	# near/far 每帧按相机距离重算，见 _update_camera。
+	#
+	# 写死 near=0.05 曾经把整颗地球裁掉：锁定地球时相机距离只有 0.0411 个
+	# 单位，比近裁剪面还近，地球直接消失，只剩月球（它在 0.05 之外）挂在
+	# 画面上。场景跨度从 0.004 到 3000 个单位，跨了六个数量级，固定的
+	# near/far 不可能同时成立。
 	camera.far = 60000.0
 	camera.near = 0.05
 	add_child(camera)
@@ -371,9 +412,10 @@ func _build_body(b: Dictionary, parent: Node3D) -> void:
 
 	# 卫星的半径下限取得比行星小得多：行星下限 0.5 会把木卫一撑到木星的
 	# 0.17 倍（真值 0.025），比例失真 7 倍。0.06 让主要卫星落在真实比例上。
-	var floor_units := 0.06 if is_sat else 0.5
+	# 网格按**真实**半径建，视觉放大交给 tilt 节点的 scale，这样卫星（挂在
+	# pivot 下）完全不受放大影响，保持真实轨道尺度。
 	var real_units := float(b["mean_radius_km"]) / eph.au_km * AU_UNITS
-	var radius_units := clampf(real_units * PLANET_EXAGGERATION, floor_units, 8.0)
+	var radius_units := maxf(real_units, 1e-9)
 
 	var pivot := Node3D.new()
 	pivot.name = nm
@@ -425,13 +467,12 @@ func _build_body(b: Dictionary, parent: Node3D) -> void:
 
 	planet_nodes[nm] = pivot
 	planet_spin[nm] = node
-	if not is_sat and real_units > 0.0:
-		# 卫星轨道与环系共用这个放大倍数，保证内部比例正确。
-		body_magnify[nm] = radius_units / real_units
+	planet_tilt[nm] = tilt
+	body_real_radius[nm] = real_units
 
 	var rings: Array = prof.get("rings", [])
 	if not rings.is_empty():
-		tilt.add_child(_build_ring_system(nm, prof, radius_units))
+		tilt.add_child(_build_ring_system(nm, prof, real_units))
 
 	if nm in ORBIT_BODIES:
 		system_root.add_child(_build_path_mesh(nm, jd_min, jd_max,
@@ -526,12 +567,12 @@ func _build_ring_system(nm: String, prof: Dictionary, planet_radius_units: float
 ## 尺寸和轨道面是准的（对照星历误差 0.00%–0.74%），相位不是。
 func _build_satellite_orbit(nm: String, parent: String) -> void:
 	var e: Dictionary = eph.satellites[nm]
-	var magnify: float = body_magnify.get(parent, 1.0)
 	var obl := float(eph.profiles.get(parent, {}).get("obliquity_deg", 0.0))
 	var period := float(e["period_days"])
 	var n := 220
 	var pts := PackedVector3Array()
-	var s := AU_UNITS / eph.au_km * magnify
+	# 真实比例：不再乘任何放大倍数。
+	var s := AU_UNITS / eph.au_km
 	for i in n:
 		var jd := float(e["epoch_jd"]) + period * float(i) / float(n - 1)
 		var off: Array = eph.satellite_offset_km(nm, jd, obl)
@@ -956,6 +997,8 @@ func _refresh() -> void:
 		lines.append("[color=#5f9e6f]轨迹数据：归档实测 + Hermite 插值[/color]")
 	else:
 		lines.append("[color=#b06060]该时刻超出星历覆盖范围[/color]")
+	if focus_note != "":
+		lines.append("[color=#d98a3a]%s[/color]" % focus_note)
 	lbl_readout.text = "\n".join(lines)
 
 	# ---- 右栏：测控几何 ----
@@ -1026,33 +1069,122 @@ func _refresh() -> void:
 ## 行星和探测器按真实比例在这个尺度下只有零点几个单位，拉远之后就是几个
 ## 亚像素的点，等于看不见。所以标记随相机距离等比放大 —— 这是示意尺寸，
 ## 不是真实比例，行星本体的相对大小仍然保留。
+## 当前的行星夸张倍数。对数插值：近处 1（真实比例），远处 EXA_MAX。
+func _exaggeration() -> float:
+	var lo := EXA_NEAR_DIST
+	var hi := EXA_FAR_DIST
+	if cam_dist <= lo:
+		return EXA_MIN
+	if cam_dist >= hi:
+		return EXA_MAX
+	var t := log(cam_dist / lo) / log(hi / lo)
+	return EXA_MIN * pow(EXA_MAX / EXA_MIN, t)
+
+
+## 某颗行星系统实际使用的放大倍数。
+##
+## 全局倍数会被**该系统最内侧卫星的轨道**卡住上限：天卫五只在 5.08 个天王星
+## 半径处，6 倍放大后天王星的渲染半径就超过了它的轨道，直接把它吞掉。所以
+## 上限取「最内侧轨道的 35%」。
+##
+## 母星和它的全部卫星共用这一个倍数，所以彼此的**相对大小仍然真实**。
+func _system_exaggeration(parent: String) -> float:
+	var exa := _exaggeration()
+	if not _showing_satellites(parent):
+		return exa
+	var r: float = body_real_radius.get(parent, 0.0)
+	var innermost := _innermost_orbit_units(parent)
+	if r <= 0.0 or innermost == INF:
+		return exa
+	return minf(exa, innermost * 0.35 / r)
+
+
+func _innermost_orbit_units(parent: String) -> float:
+	var v := INF
+	for nm in eph.satellites:
+		if String(eph.satellites[nm]["parent"]) != parent:
+			continue
+		v = minf(v, float(eph.satellites[nm]["semi_major_km"]) / eph.au_km * AU_UNITS)
+	return v
+
+
+func _outermost_orbit_units(parent: String) -> float:
+	var v := 0.0
+	for nm in eph.satellites:
+		if String(eph.satellites[nm]["parent"]) != parent:
+			continue
+		v = maxf(v, float(eph.satellites[nm]["semi_major_km"]) / eph.au_km * AU_UNITS)
+	return v
+
+
+## 某颗行星的卫星系统此刻是否该显示。
+##
+## 判据是「最外侧卫星轨道在画面里占得下」：拉远看太阳系时整个卫星系统只有
+## 亚像素大小，画出来只是一团噪声，不如不画。
+func _showing_satellites(parent: String) -> bool:
+	var outer := _outermost_orbit_units(parent)
+	if outer <= 0.0:
+		return false
+	return cam_dist < outer * 12.0
+
+
 func _scale_markers() -> void:
-	var k := maxf(1.0, cam_dist * 0.0016)
-	for n in planet_nodes:
-		planet_nodes[n].scale = Vector3.ONE * k
-	# 探测器的缩放：近处固定世界尺寸，远处才按距离放大。
+	var global_exa := _exaggeration()
+	for n in planet_tilt:
+		var t: Node3D = planet_tilt[n]
+		var r: float = body_real_radius.get(n, 0.0)
+		# 卫星跟着母星用同一个系统倍数，行星用自己系统的倍数。
+		var owner_name: String = n
+		if eph.satellites.has(n):
+			owner_name = String(eph.satellites[n]["parent"])
+		var sc := _system_exaggeration(owner_name) if (
+			eph.satellites.has(n) or _outermost_orbit_units(n) > 0.0) else global_exa
+		# 屏幕最小尺寸下限。
+		#
+		# 这一项会**破坏**母星与卫星之间的尺寸比例，而且是不得不为：天卫五
+		# 真实直径只有 472 km，在框住它 12.98 万公里轨道的视距下只有四分之一
+		# 个像素。不给下限就是彻底看不见。给了下限，它相对天王星就被撑大约
+		# 3.8 倍。
+		#
+		# 这里的取舍是：**轨道尺度保持真实**（这是最要紧的，也是「月球离婚」
+		# 那个 bug 的正解），天体本身允许被撑到最小可见尺寸。撑大的倍数记在
+		# _size_inflation 里，自检会把它逐个打出来，不藏。
+		var inflation := 1.0
+		if r > 0.0:
+			var min_units := cam_dist * 0.0016
+			var floored := maxf(sc, min_units / r)
+			inflation = floored / maxf(sc, 1e-12)
+			sc = floored
+		_size_inflation[n] = inflation
+		# 卫星另外受一条约束：渲染半径不能超过自身轨道半径的 15%。
+		if eph.satellites.has(n):
+			var a_units := float(eph.satellites[n]["semi_major_km"]) / eph.au_km * AU_UNITS
+			sc = minf(sc, a_units * 0.15 / maxf(r, 1e-12))
+		t.scale = Vector3.ONE * minf(sc, 3.0e5)
+
+	for nm in eph.satellites:
+		if not planet_nodes.has(nm):
+			continue
+		var parent := String(eph.satellites[nm]["parent"])
+		var show := _showing_satellites(parent)
+		if satellite_orbits.has(nm):
+			(satellite_orbits[nm] as Node3D).visible = show
+		_satellite_allowed[nm] = show
+
+	# 探测器的缩放分两种情形。
 	#
-	# 早先做成了纯粹的「恒定视角大小」（scale ∝ cam_dist），后果是无论怎么
-	# 放大它都只占屏幕 4% —— **永远凑不近看**。对一个数字孪生来说这是错的，
-	# 拉近检视本来就是核心操作。
-	#
-	# 现在：pk = max(近处固定值, cam_dist × 系数)
-	#   近处 —— 固定 0.50。基准要看**碟面**（直径 3.8）而不是整机跨度 17，
-	#           因为那 17 里有 15 米是几乎看不见的磁强计桁架。
-	#           原本取 1.1，但飞掠时探测器把行星整个挡住了 —— 天王星特写里
-	#           两者只隔 100 万公里，夸张后的探测器直接盖在行星前面。
-	#           压到 0.50 后仍可推近到充满画面（cam_dist 3 时占屏高约 41%）。
-	#   远处 —— 按 0.0011·d 放大以免消失，上限 5.0。
-	#
-	# 这个远处系数是压过一次的：早先取 0.016，结果在木星飞掠的视距上探测器
-	# 的碟面有 9.7 个单位、而木星直径只有 3.7 —— 探测器比木星还大，荒谬。
-	# 两者的夸张倍数本来就天差地别（行星约 620 倍，探测器约 4 亿倍），
-	# 没有诚实的可比性，但至少不能让人看出「探测器比行星大」这种反直觉画面。
-	var pk := clampf(maxf(0.50, cam_dist * 0.0011), 0.50, 5.0)
+	# 聚焦在它身上时给一个固定的世界尺寸下限，这样能一路推近检视部件。
+	# 但**不**聚焦它时必须走恒定视角大小 —— 否则在行星系统视距下（比如
+	# 锁定木星时相机距离只有 0.2 个单位）那个 0.50 的下限会让探测器的碟面
+	# 达到 1.9 个单位，而木星的渲染半径只有 0.0099，探测器比木星大 190 倍，
+	# 一堆白色结构糊满整个画面。
+	var pk: float
+	if focus_target == "voyager2":
+		pk = clampf(maxf(0.50, cam_dist * 0.0011), 0.50, 5.0)
+	else:
+		pk = clampf(cam_dist * 0.012, 1.0e-7, 5.0)
 	if probe_model != null:
 		probe_model.scale = Vector3.ONE * pk
-	# 光晕只是**远距离的定位提示**：拉远时它是唯一能让人找到探测器的线索，
-	# 但凑近时必须让路 —— 加法混合的光晕会把模型本身糊成一团发光的球。
 	var halo_on := cam_dist > 140.0
 	probe_marker.visible = halo_on
 	if halo_on:
@@ -1073,12 +1205,12 @@ func _place_satellite(nm: String, pivot: Node3D) -> void:
 	var ps := eph.state_at(parent, jd_now)
 	var ms := eph.state_at(nm, jd_now)
 	var resolved: bool = eph.satellite_position_is_resolved(nm, jd_now)
-	pivot.visible = bool(ms["in_range"]) and bool(ps["in_range"]) and resolved
+	pivot.visible = (bool(ms["in_range"]) and bool(ps["in_range"]) and resolved
+		and bool(_satellite_allowed.get(nm, false)))
 	if not pivot.visible:
 		return
-	# 相对母星的偏移，按母星的放大倍数等比放大。
-	var magnify: float = body_magnify.get(parent, 1.0)
-	var s := AU_UNITS / eph.au_km * magnify
+	# 真实比例的相对偏移。
+	var s := AU_UNITS / eph.au_km
 	var dx := float(ms["pos"][0]) - float(ps["pos"][0])
 	var dy := float(ms["pos"][1]) - float(ps["pos"][1])
 	var dz := float(ms["pos"][2]) - float(ps["pos"][2])
@@ -1187,6 +1319,17 @@ func _update_camera() -> void:
 		cos(cam_pitch) * sin(cam_yaw), sin(cam_pitch), cos(cam_pitch) * cos(cam_yaw))
 	camera.position = target + dir * cam_dist
 	camera.look_at(target, Vector3.UP)
+	# 近/远裁剪面都按相机距离缩放，而且**比例必须收在安全范围**。
+	#
+	# 场景跨度从 0.004 到 3000 个单位，跨六个数量级，固定的 near/far 不可能
+	# 同时成立：写死 near=0.05 会把锁定地球时（相机距离 0.0411）的地球整个
+	# 裁掉。但第一版修正取 near=cam_dist·0.0012、far=8000，比例达到 1.6e8，
+	# 深度精度直接崩掉，画面全空 —— 从一个极端跳到另一个极端。
+	#
+	# 现在固定比例 8e4：近处看得到贴脸的天体，远处装得下该视距下有意义的
+	# 内容。行星系统视图里看不到整条航迹，这是可接受的取舍。
+	camera.near = clampf(cam_dist * 0.01, 1.0e-5, 20.0)
+	camera.far = camera.near * 8.0e4
 
 
 ## 当前相机锁定的目标位置。
@@ -1202,12 +1345,46 @@ func _focus_position() -> Vector3:
 		var n: Node3D = planet_nodes[focus_target]
 		if n.visible:
 			return n.global_position
+		# 卫星此刻不可见（星历采样不足以定位它）。回退到**母星**而不是静默
+		# 跳回原点 —— 原点是太阳，而取景距离已经被设成 0.006 个单位，相机会
+		# 直接钻进太阳内部，画面完全莫名其妙。用户报的「点啥都对准某颗星」
+		# 就是这个。
+		if eph.satellites.has(focus_target):
+			var parent := String(eph.satellites[focus_target]["parent"])
+			if planet_nodes.has(parent):
+				return (planet_nodes[parent] as Node3D).global_position
 	return Vector3.ZERO
 
 
 ## 切换锁定目标，并把相机距离调到能框住它的量级。
+## 各颗行星的飞掠历元 —— 只有这些窗口里才有 30 分钟采样，也就是唯一能
+## 准确定位内侧卫星的时段。
+const ENCOUNTER_DATE := {
+	"jupiter": "1979-07-09", "saturn": "1981-08-26",
+	"uranus": "1986-01-24", "neptune": "1989-08-25",
+}
+
+
 func _set_focus(target: String) -> void:
 	focus_target = target
+	focus_note = ""
+
+	# 锁定一颗只有飞掠期才有数据的卫星时，直接把时间轴带到那次飞掠。
+	#
+	# 这不是取巧：木卫一 1.77 天一圈，日采样只有 0.56 个样本每圈，别处的
+	# 位置本来就不该显示。与其让用户对着一个空位置发愣，不如带他去唯一
+	# 知道答案的时刻，并说明为什么。
+	if target != "" and eph.satellites.has(target):
+		if not eph.satellite_position_is_resolved(target, jd_now):
+			var parent := String(eph.satellites[target]["parent"])
+			var date := String(ENCOUNTER_DATE.get(parent, ""))
+			if date != "":
+				var jd := _event_jd(date)
+				if jd != jd_max:
+					_seek(jd)
+					focus_note = "已跳到 %s 飞掠 —— 只有这个窗口有 30 分钟采样，别处日采样定不出它的位置" % date
+			if focus_note == "":
+				focus_note = "该卫星在此刻的星历采样不足以定位，已回退到母星"
 	# 按目标的渲染尺寸自动取景，免得锁到月球却还是全太阳系的视距。
 	var d := 2400.0
 	if target == "voyager2":
@@ -1216,17 +1393,20 @@ func _set_focus(target: String) -> void:
 		var prof: Dictionary = eph.profiles[target]
 		var body: Dictionary = eph.body_by_name.get(target, {})
 		var real_units := float(body.get("mean_radius_km", 1000.0)) / eph.au_km * AU_UNITS
-		var floor_units: float = 0.06 if eph.satellites.has(target) else 0.5
-		var r := clampf(real_units * PLANET_EXAGGERATION, floor_units, 8.0)
-		# 有环的话要把环也框进来
-		var span := r
+		var r := real_units
+		# 取景要把该有的东西都框进来：环系、以及最外侧卫星的轨道。
+		var span := r * 40.0
 		var rings: Array = prof.get("rings", [])
 		if not rings.is_empty():
 			var hi := 0.0
 			for band in rings:
 				hi = maxf(hi, float(band["outer_km"]))
-			span = r * hi / float(prof["equatorial_radius_km"])
-		d = maxf(span * 4.0, 1.2)
+			span = maxf(span, real_units * hi / float(prof["equatorial_radius_km"]) * 3.0)
+		for snm in eph.satellites:
+			if String(eph.satellites[snm]["parent"]) != target:
+				continue
+			span = maxf(span, float(eph.satellites[snm]["semi_major_km"]) / eph.au_km * AU_UNITS * 1.6)
+		d = maxf(span, 0.006)
 	cam_dist = d
 	if btn_focus != null:
 		for i in btn_focus.item_count:
@@ -1248,7 +1428,7 @@ func _unhandled_input(event: InputEvent) -> void:
 	elif event is InputEventMouseButton:
 		var mb := event as InputEventMouseButton
 		if mb.button_index == MOUSE_BUTTON_WHEEL_UP and mb.pressed:
-			cam_dist = maxf(cam_dist * 0.88, 3.0)
+			cam_dist = maxf(cam_dist * 0.88, 0.004)
 			_update_camera()
 		elif mb.button_index == MOUSE_BUTTON_WHEEL_DOWN and mb.pressed:
 			cam_dist = minf(cam_dist * 1.14, 40000.0)
@@ -1543,20 +1723,25 @@ func _run_screenshot_harness() -> void:
 			"dist": 20.0, "focus_body": "neptune", "deselect": true,
 			"yaw": 1.2, "pitch": 0.35},
 		{"name": "14_jupiter_moons", "jd": _event_jd("1979-07-09"), "mode": ViewMode.SYSTEM,
-			"dist": 62.0, "focus_body": "jupiter", "deselect": true,
-			"yaw": 0.5, "pitch": 0.55},
+			"lock": "jupiter", "deselect": true, "yaw": 0.5, "pitch": 0.62},
 		{"name": "15_earth_moon", "jd": jd_min + 3000.0, "mode": ViewMode.SYSTEM,
-			"dist": 46.0, "focus_body": "earth", "deselect": true,
-			"yaw": 0.7, "pitch": 0.40},
+			"lock": "earth", "deselect": true, "yaw": 0.7, "pitch": 0.45},
+		{"name": "16_saturn_titan", "jd": _event_jd("1981-08-26"), "mode": ViewMode.SYSTEM,
+			"lock": "saturn", "deselect": true, "yaw": 1.0, "pitch": 0.38},
 	]
 
 	for st in steps:
 		_seek(float(st["jd"]))
 		_set_mode(st["mode"])
-		cam_dist = float(st["dist"])
+		cam_dist = float(st.get("dist", 0.0))
 		_shot_focus_probe = st.has("focus_probe")
 		_shot_focus_sun = st.has("focus_sun")
 		_shot_focus_body = String(st.get("focus_body", ""))
+		if st.has("lock"):
+			_shot_focus_body = ""
+			_set_focus(String(st["lock"]))
+		else:
+			focus_target = ""
 		if st.has("deselect"):
 			selected_component = ""
 			record_panel.visible = false
@@ -1735,4 +1920,120 @@ func _run_orbit_selftest() -> void:
 				nm, jd, d, JDTime.sci(rel)])
 	print("ORBITTEST_DONE 基准点 %d  失配 %d  最大相对偏差 %s (%s)" % [
 		checks.size(), fails, JDTime.sci(worst), worst_name])
+	get_tree().quit()
+
+
+## 尺度自检：守住用户实际发现的那个 bug。
+##
+## 原来的做法是拿行星半径的夸张倍数去放大卫星轨道。地球被 0.5 单位的半径
+## 下限把 620 倍抬成 1173 倍，于是月球被甩到地球公转轨道的 3 倍远（用户
+## 一眼看出「月球和地球离婚了」）；木卫四的轨道也比木星自己的公转轨道还宽。
+##
+## 这条自检断言两件事：
+##   1. 任何卫星的轨道半径都必须远小于母星的公转轨道半径
+##   2. 锁定母星后，卫星与母星的**渲染**距离比要接近真实比值
+##      （月球 / 地球半径 = 60.3）
+##   Godot --path . -- --scaletest
+func _run_scale_selftest() -> void:
+	_set_mode(ViewMode.SYSTEM)
+	var fails := 0
+
+	print("--- 卫星轨道 vs 母星公转轨道 ---")
+	for nm in eph.satellites:
+		var parent := String(eph.satellites[nm]["parent"])
+		var a_units := float(eph.satellites[nm]["semi_major_km"]) / eph.au_km * AU_UNITS
+		var ps := eph.state_at(parent, jd_now)
+		var orbit_r := JDTime.vec_len(ps["pos"]) / eph.au_km * AU_UNITS
+		var ratio := a_units / maxf(orbit_r, 1e-9)
+		var ok := ratio < 0.05
+		if not ok:
+			fails += 1
+		print("SCALETEST %-9s 轨道 %9.5f 单位 / 母星公转 %8.2f 单位 = %.5f  %s" % [
+			nm, a_units, orbit_r, ratio, "OK" if ok else "FAIL 卫星轨道过大"])
+
+	print("--- 锁定母星后的渲染比例 ---")
+	# 每颗卫星必须用它自己那次飞掠的历元 —— 别处只有日采样，位置本就不该显示。
+	var epoch_for := {
+		"moon": jd_min + 3000.0,
+		"io": _event_jd("1979-07-09"), "europa": _event_jd("1979-07-09"),
+		"titan": _event_jd("1981-08-26"), "miranda": _event_jd("1986-01-24"),
+		"triton": _event_jd("1989-08-25"),
+	}
+	for nm in ["moon", "io", "europa", "titan", "miranda", "triton"]:
+		if not eph.satellites.has(nm):
+			continue
+		var parent := String(eph.satellites[nm]["parent"])
+		_seek(float(epoch_for.get(nm, jd_now)))
+		_set_focus(parent)
+		await get_tree().process_frame
+		_refresh()
+		var pv: Node3D = planet_nodes[parent]
+		var sv: Node3D = planet_nodes[nm]
+		var sep := (sv.global_position - pv.global_position).length()
+		# 母星的渲染半径 = 真实半径 × tilt 缩放
+		var r_render: float = body_real_radius[parent] * (planet_tilt[parent] as Node3D).scale.x
+		var exa := _system_exaggeration(parent)
+		# 断言一：卫星轨道是**真实尺度**（这是用户发现的那个 bug 的正解）。
+		# 渲染出来的「轨道/天体半径」应当等于真实比值 ÷ 放大倍数。
+		var rendered_ratio := sep / maxf(r_render, 1e-12)
+		var true_ratio := (float(eph.satellites[nm]["semi_major_km"])
+			/ float(eph.profiles[parent]["equatorial_radius_km"]))
+		var expect := true_ratio / exa
+		var err := absf(rendered_ratio - expect) / expect
+		# 断言二：尺寸比例只允许被「屏幕最小尺寸下限」**向上**撑大，
+		# 不允许被缩小，而且撑大的倍数必须与记录的 inflation 一致。
+		var r_sat: float = body_real_radius[nm] * (planet_tilt[nm] as Node3D).scale.x
+		var size_ratio := r_sat / maxf(r_render, 1e-12)
+		var true_size_ratio := (float(eph.profiles[nm]["equatorial_radius_km"])
+			/ float(eph.profiles[parent]["equatorial_radius_km"]))
+		var inflation: float = float(_size_inflation.get(nm, 1.0))
+		var parent_infl: float = float(_size_inflation.get(parent, 1.0))
+		var expect_size := true_size_ratio * inflation / maxf(parent_infl, 1e-12)
+		var size_err := absf(size_ratio - expect_size) / maxf(expect_size, 1e-12)
+		var never_shrunk := size_ratio >= true_size_ratio * 0.9
+		var ok2 := err < 0.35 and size_err < 0.35 and never_shrunk
+		if not ok2:
+			fails += 1
+		print("SCALETEST %-9s 锁定 %-8s 轨道比 %7.2f (期望 %7.2f, 偏差 %4.1f%%)  尺寸比 %7.4f (真值 %7.4f, 可见性撑大 %5.2f×, 偏差 %4.1f%%)  %s" % [
+			nm, parent, rendered_ratio, expect, err * 100.0,
+			size_ratio, true_size_ratio, inflation / maxf(parent_infl, 1e-12),
+			size_err * 100.0, "OK" if ok2 else "FAIL"])
+
+	print("SCALETEST_DONE 失败 %d" % fails)
+	get_tree().quit()
+
+
+## 相机锁定自检：逐个选中下拉框里的每一项，验证相机真的对准了它。
+##   Godot --path . -- --focustest
+func _run_focus_selftest() -> void:
+	_set_mode(ViewMode.SYSTEM)
+	var fails := 0
+	for i in btn_focus.item_count:
+		var meta := String(btn_focus.get_item_metadata(i))
+		var label := btn_focus.get_item_text(i)
+		# 走真实路径：模拟用户点选
+		btn_focus.selected = i
+		_set_focus(meta)
+		await get_tree().process_frame
+		_refresh()
+
+		var want := Vector3.ZERO
+		var what := "太阳/原点"
+		if meta == "voyager2":
+			want = probe_root.global_position
+			what = "探测器"
+		elif meta != "" and planet_nodes.has(meta):
+			want = (planet_nodes[meta] as Node3D).global_position
+			what = meta
+		# 相机看向的点：位置 + 前方 × 距离
+		var looking_at := camera.global_position - camera.global_transform.basis.z * cam_dist
+		var err := (looking_at - want).length()
+		# 误差按相机距离归一（同样的绝对误差在近景是灾难、在远景无所谓）
+		var rel := err / maxf(cam_dist, 1e-9)
+		var ok := rel < 0.02
+		if not ok:
+			fails += 1
+		print("FOCUSTEST %-22s meta=%-10s 目标=%-10s 距离=%10.5f 偏差=%s  %s" % [
+			label.strip_edges(), meta, what, cam_dist, JDTime.sci(rel), "OK" if ok else "FAIL"])
+	print("FOCUSTEST_DONE 项数 %d 失败 %d" % [btn_focus.item_count, fails])
 	get_tree().quit()
