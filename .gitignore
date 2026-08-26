@@ -12,3 +12,6 @@
 /godot/assets/*.glb
 # 构建产物
 /dist/
+# macOS Finder 垃圾文件
+.DS_Store
+**/.DS_Store
