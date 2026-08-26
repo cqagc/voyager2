@@ -23,9 +23,11 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/cqagc/voyager2/internal/bodies"
 	"github.com/cqagc/voyager2/internal/domain"
 	"github.com/cqagc/voyager2/internal/horizons"
 	"github.com/cqagc/voyager2/internal/model"
+	"github.com/cqagc/voyager2/internal/orbit"
 	"github.com/cqagc/voyager2/internal/power"
 	"github.com/cqagc/voyager2/internal/store"
 )
@@ -78,6 +80,45 @@ type ComponentMeta struct {
 	ConfidenceNote   string `json:"confidence_note"`
 }
 
+// SatelliteElements is a moon's Keplerian orbit, shipped so the front end can
+// draw its orbit ring without needing dense ephemeris.
+//
+// Only the GEOMETRY is trustworthy. internal/orbit's tests measure the phase
+// error against real ephemeris in the flyby windows: 19% to 200% of the
+// semi-major axis, i.e. up to the opposite side of the planet, because the
+// encounters are 11-21 years from the J2000 element epoch. So the front end
+// must draw the ring from these elements but take the moon's POSITION from the
+// ephemeris, and hide the moon where the ephemeris is too coarse to resolve
+// its period.
+type SatelliteElements struct {
+	Name         string  `json:"name"`
+	Label        string  `json:"label"`
+	Parent       string  `json:"parent"`
+	SemiMajorKm  float64 `json:"semi_major_km"`
+	Ecc          float64 `json:"ecc"`
+	IncDeg       float64 `json:"inc_deg"`
+	ArgPeriDeg   float64 `json:"arg_peri_deg"`
+	NodeDeg      float64 `json:"node_deg"`
+	MeanAnomDeg  float64 `json:"mean_anom_deg"`
+	PeriodDays   float64 `json:"period_days"`
+	EpochJD      float64 `json:"epoch_jd"`
+	MeanRadiusKm float64 `json:"mean_radius_km"`
+	// PhaseTrustworthy is false for every satellite here, recorded explicitly
+	// so the front end cannot assume otherwise by omission.
+	PhaseTrustworthy bool `json:"phase_trustworthy"`
+}
+
+// SatelliteCheckPoint is one reference evaluation of the Kepler solver.
+type SatelliteCheckPoint struct {
+	Name string  `json:"name"`
+	JD   float64 `json:"jd"`
+	// ObliquityDeg is the parent obliquity used, so the front end applies the
+	// same frame rotation.
+	ObliquityDeg float64 `json:"obliquity_deg"`
+	// OffsetKm is the expected offset from the parent in ecliptic J2000.
+	OffsetKm [3]float64 `json:"offset_km"`
+}
+
 // Bundle is metadata.json.
 type Bundle struct {
 	Generated  string          `json:"generated"`
@@ -89,6 +130,20 @@ type Bundle struct {
 	Components []ComponentMeta `json:"components"`
 	PowerCurve []PowerPoint    `json:"power_curve"`
 	Events     []Event         `json:"events"`
+	// Profiles carries obliquity, rotation, ring systems and appearance for
+	// every body. Kept in Go (internal/bodies) rather than duplicated in
+	// GDScript so the two cannot drift apart.
+	Profiles   []bodies.Profile    `json:"profiles"`
+	Satellites []SatelliteElements `json:"satellites"`
+	// RingRenderFloorKm is the width narrow rings are widened to for
+	// rendering. Uranus's rings are 1-96 km wide against a 25,559 km planet;
+	// at true width they would be far thinner than a pixel at any zoom.
+	RingRenderFloorKm float64 `json:"ring_render_floor_km"`
+	// SatelliteCheck is a cross-language contract fixture. The front end
+	// reimplements the Kepler solver in GDScript for per-frame use; these
+	// reference values let it verify it agrees with the Go implementation
+	// instead of the two silently drifting apart.
+	SatelliteCheck []SatelliteCheckPoint `json:"satellite_check"`
 	// ProvenanceLegend spells out what each label means, so the front end
 	// cannot present a modelled number as a measurement by omission.
 	ProvenanceLegend map[string]string `json:"provenance_legend"`
@@ -176,8 +231,12 @@ func run(dbPath, outDir, assignPath string, powerStepDays int) error {
 		Units:     "km, km/s, JDTDB",
 		AUkm:      domain.AU,
 		Bodies:    metas, Components: components,
-		PowerCurve: powerCurve(powerStepDays),
-		Events:     events(),
+		PowerCurve:        powerCurve(powerStepDays),
+		Events:            events(),
+		Profiles:          bodies.Profiles,
+		Satellites:        satelliteElements(),
+		RingRenderFloorKm: bodies.MinRenderWidthKm,
+		SatelliteCheck:    satelliteCheck(),
 		ProvenanceLegend: map[string]string{
 			string(domain.ProvMeasured):     "归档实测数据",
 			string(domain.ProvLive):         "近实时观测（目前仅 DSN 链路状态）",
@@ -257,6 +316,44 @@ func events() []Event {
 			continue
 		}
 		out = append(out, Event{JD: domain.TimeToJD(t), Date: r.date, Label: r.label, Focus: r.focus})
+	}
+	return out
+}
+
+func satelliteElements() []SatelliteElements {
+	out := make([]SatelliteElements, 0, len(orbit.Satellites))
+	for _, e := range orbit.Satellites {
+		out = append(out, SatelliteElements{
+			Name: e.Name, Label: e.Label, Parent: e.Parent,
+			SemiMajorKm: e.SemiMajorKm, Ecc: e.Ecc, IncDeg: e.IncDeg,
+			ArgPeriDeg: e.ArgPeriDeg, NodeDeg: e.NodeDeg,
+			MeanAnomDeg: e.MeanAnomDeg, PeriodDays: e.PeriodDays,
+			EpochJD: orbit.J2000, MeanRadiusKm: e.MeanRadiusKm,
+			PhaseTrustworthy: false,
+		})
+	}
+	return out
+}
+
+// satelliteCheck evaluates the Go Kepler solver at fixed epochs so the front
+// end can prove its GDScript port matches.
+func satelliteCheck() []SatelliteCheckPoint {
+	epochs := []float64{orbit.J2000, orbit.J2000 + 0.37, orbit.J2000 + 1234.5,
+		orbit.J2000 - 8000.25, 2461278.0}
+	out := make([]SatelliteCheckPoint, 0, len(orbit.Satellites)*len(epochs))
+	for _, e := range orbit.Satellites {
+		prof, ok := bodies.ByName(e.Parent)
+		obl := 0.0
+		if ok {
+			obl = prof.ObliquityDeg
+		}
+		for _, jd := range epochs {
+			p := e.PositionEclipticOffset(jd, obl)
+			out = append(out, SatelliteCheckPoint{
+				Name: e.Name, JD: jd, ObliquityDeg: obl,
+				OffsetKm: [3]float64{p.X, p.Y, p.Z},
+			})
+		}
 	}
 	return out
 }

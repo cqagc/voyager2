@@ -21,6 +21,11 @@ var body_by_name: Dictionary = {}
 var components: Array = []
 var power_curve: Array = []
 var events: Array = []
+## 天体外观与物理参数，来自 Go 侧 internal/bodies（不在 GDScript 里另存一份）。
+var profiles: Dictionary = {}
+## 卫星轨道要素，来自 Go 侧 internal/orbit。只有几何可信，相位不可信。
+var satellites: Dictionary = {}
+var ring_render_floor_km := 260.0
 var au_km: float = 149597870.7
 
 var _blob: PackedByteArray = PackedByteArray()
@@ -56,6 +61,11 @@ func load_bundle(meta_path: String, bin_path: String) -> String:
 	components = metadata.get("components", [])
 	power_curve = metadata.get("power_curve", [])
 	events = metadata.get("events", [])
+	for pr in metadata.get("profiles", []):
+		profiles[pr["name"]] = pr
+	for sa in metadata.get("satellites", []):
+		satellites[sa["name"]] = sa
+	ring_render_floor_km = float(metadata.get("ring_render_floor_km", 260.0))
 	au_km = float(metadata.get("au_km", au_km))
 	for b in bodies:
 		body_by_name[b["name"]] = b
@@ -200,3 +210,93 @@ func power_at(jd: float) -> Dictionary:
 		"fuel_fraction": lerpf(float(a["fuel_fraction"]), float(b["fuel_fraction"]), f),
 		"converter_fraction": lerpf(float(a["converter_fraction"]), float(b["converter_fraction"]), f),
 	}
+
+
+## 某天体在 jd 附近的相邻样本间隔（天）。
+##
+## 用来判断星历能不能表示这个卫星的公转：木卫一 1.77 天一圈，日采样只有
+## 0.56 个样本每圈，插出来是混叠的垃圾。低于约 8 个样本每圈就不该把它的
+## 位置当真。
+func sample_spacing_days(body_name: String, jd: float) -> float:
+	if not body_by_name.has(body_name):
+		return INF
+	var b: Dictionary = body_by_name[body_name]
+	var count: int = int(b["samples"])
+	var offset: int = int(b["byte_offset"])
+	if count < 2:
+		return INF
+	var lo := _sample_jd(offset, 0)
+	var hi := _sample_jd(offset, count - 1)
+	var clamped := clampf(jd, lo, hi)
+	var i := _find_index(offset, count, clamped)
+	var j := mini(i + 1, count - 1)
+	if i == j:
+		return INF
+	return absf(_sample_jd(offset, j) - _sample_jd(offset, i))
+
+
+## 该卫星在此刻能否用星历定位。
+func satellite_position_is_resolved(body_name: String, jd: float) -> bool:
+	if not satellites.has(body_name):
+		return true
+	var period := float(satellites[body_name]["period_days"])
+	if period <= 0.0:
+		return true
+	var gap := sample_spacing_days(body_name, jd)
+	if gap == INF:
+		return false
+	return period / gap >= 8.0
+
+
+## 卫星轨道要素解 —— 只用来画轨道环。
+##
+## 与 Go 侧 internal/orbit 的实现必须一致；GDScript 这份是为了逐帧计算，
+## 一致性由 --orbittest 自检对着 Go 生成的基准值校验。
+## 返回 [x, y, z]（公里，黄道 J2000），**不是 Vector3**。
+##
+## Vector3 的分量在官方标准构建里是 float32，40 万公里量级上分辨率约 0.03 km。
+## 跨语言契约自检一开始就是因为这个报出约 0.014 km 的偏差 —— 那不是算法不
+## 一致，是把 double 塞进 float32 丢的精度。星历那边一直用裸 Array 保持
+## double，这里当初漏了。
+func satellite_offset_km(body_name: String, jd: float, parent_obliquity_deg: float) -> Array:
+	if not satellites.has(body_name):
+		return [0.0, 0.0, 0.0]
+	var e: Dictionary = satellites[body_name]
+	var period := float(e["period_days"])
+	if period <= 0.0:
+		return [0.0, 0.0, 0.0]
+	var ecc := float(e["ecc"])
+	var n := TAU / period
+	var m: float = deg_to_rad(float(e["mean_anom_deg"])) + n * (jd - float(e["epoch_jd"]))
+	m = fposmod(m, TAU)
+
+	# 牛顿迭代解开普勒方程 E - e·sinE = M
+	var ea := m
+	for _i in 32:
+		var f := ea - ecc * sin(ea) - m
+		var fp := 1.0 - ecc * cos(ea)
+		if absf(fp) < 1e-15:
+			break
+		var d := f / fp
+		ea -= d
+		if absf(d) < 1e-14:
+			break
+
+	var a := float(e["semi_major_km"])
+	var xv := a * (cos(ea) - ecc)
+	var yv := a * sqrt(1.0 - ecc * ecc) * sin(ea)
+
+	var w := deg_to_rad(float(e["arg_peri_deg"]))
+	var inc := deg_to_rad(float(e["inc_deg"]))
+	var om := deg_to_rad(float(e["node_deg"]))
+	var x1 := xv * cos(w) - yv * sin(w)
+	var y1 := xv * sin(w) + yv * cos(w)
+	var y2 := y1 * cos(inc)
+	var z2 := y1 * sin(inc)
+	var px := x1 * cos(om) - y2 * sin(om)
+	var py := x1 * sin(om) + y2 * cos(om)
+	var pz := z2
+
+	# 母星赤道面 -> 黄道 J2000
+	var t := deg_to_rad(parent_obliquity_deg)
+	return [px, py * cos(t) - pz * sin(t), py * sin(t) + pz * cos(t)]

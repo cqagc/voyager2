@@ -50,6 +50,8 @@ var fatal_error := ""
 var system_root: Node3D
 var planet_nodes := {}
 var planet_spin := {}
+var body_magnify := {}
+var satellite_orbits := {}
 var saturn_rings: MeshInstance3D
 var probe_marker: MeshInstance3D
 var probe_root: Node3D
@@ -110,6 +112,9 @@ var _drag_travel := 0.0
 var _shot_focus_probe := false
 var _shot_focus_sun := false
 var _shot_focus_body := ""
+## 相机锁定目标："" = 太阳，"voyager2" = 跟随探测器，其余为天体名。
+var focus_target := ""
+var btn_focus: OptionButton
 var _syncing_slider := false
 
 
@@ -143,6 +148,8 @@ func _ready() -> void:
 		_run_pick_selftest.call_deferred()
 	if "--attitudetest" in OS.get_cmdline_user_args():
 		_run_attitude_selftest.call_deferred()
+	if "--orbittest" in OS.get_cmdline_user_args():
+		_run_orbit_selftest.call_deferred()
 	print("孪生体就绪：%d 天体，%d 组件，时间跨度 %s .. %s" % [
 		eph.bodies.size(), eph.components.size(),
 		JDTime.format_date_short(jd_min), JDTime.format_date_short(jd_max)])
@@ -211,70 +218,27 @@ func _build_system_view() -> void:
 	corona.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	system_root.add_child(corona)
 
+	# 先建行星，再建卫星（卫星要挂在母星下面）。
 	for b in eph.bodies:
-		var name_str: String = b["name"]
-		if bool(b["is_spacecraft"]):
+		if bool(b["is_spacecraft"]) or eph.satellites.has(String(b["name"])):
 			continue
-		var radius_units := clampf(
-			float(b["mean_radius_km"]) / eph.au_km * AU_UNITS * PLANET_EXAGGERATION, 0.5, 8.0)
+		_build_body(b, null)
 
-		# 三层结构：pivot 定位 / tilt 摆自转轴 / mesh 自转。
-		# 环必须挂在 tilt 下面，因为环位于行星赤道面内，跟着自转轴一起倾斜。
-		var pivot := Node3D.new()
-		pivot.name = name_str
-		system_root.add_child(pivot)
-
-		var tilt := Node3D.new()
-		# 对轨道倾角。天王星 97.8° —— 它基本是躺着转的。
-		tilt.rotation_degrees = Vector3(0, 0, float(BodyData.OBLIQUITY.get(name_str, 0.0)))
-		pivot.add_child(tilt)
-
-		var node := MeshInstance3D.new()
-		var mesh := SphereMesh.new()
-		mesh.radius = radius_units
-		mesh.height = radius_units * 2.0
-		mesh.radial_segments = 48
-		mesh.rings = 24
-		node.mesh = mesh
-		var col: Color = PLANET_COLORS.get(name_str, Color(0.7, 0.7, 0.7))
-		var mat := ShaderMaterial.new()
-		mat.shader = load("res://shaders/planet.gdshader")
-		mat.set_shader_parameter("base_color", col)
-		mat.set_shader_parameter("kind", KIND_ID.get(String(BodyData.KIND.get(name_str, "rocky")), 0))
-		var atmo: Dictionary = BodyData.ATMOSPHERE.get(name_str, {})
-		mat.set_shader_parameter("atmo_color", atmo.get("color", Color(0.5, 0.7, 1.0)))
-		mat.set_shader_parameter("atmo_power", float(atmo.get("power", 0.0)))
-		match name_str:
-			"jupiter":
-				mat.set_shader_parameter("band_tint", Color(0.62, 0.38, 0.24))
-				mat.set_shader_parameter("band_freq", 11.0)
-				# 大红斑：一个跨了几百年的反气旋。
-				mat.set_shader_parameter("spot_size", 0.30)
-				mat.set_shader_parameter("spot_color", Color(0.80, 0.34, 0.20))
-			"saturn":
-				mat.set_shader_parameter("band_tint", Color(0.72, 0.56, 0.34))
-				mat.set_shader_parameter("band_freq", 8.0)
-			"uranus":
-				mat.set_shader_parameter("band_freq", 4.0)
-			"neptune":
-				mat.set_shader_parameter("band_freq", 6.0)
-				# 大暗斑（1989 年旅行者 2 号拍到的那个，后来消失了）
-				mat.set_shader_parameter("spot_size", 0.26)
-				mat.set_shader_parameter("spot_lat", -0.42)
-				mat.set_shader_parameter("spot_color", Color(0.10, 0.16, 0.42))
-		node.material_override = mat
-		tilt.add_child(node)
-
-		planet_nodes[name_str] = pivot
-		planet_spin[name_str] = node
-
-		if name_str == "saturn":
-			tilt.add_child(_build_saturn_rings(radius_units))
-
-		if name_str in ORBIT_BODIES:
-			system_root.add_child(_build_path_mesh(name_str, jd_min, jd_max,
-				col.lerp(Color(0.35, 0.85, 1.0), 0.55), Color(0.55, 0.35, 1.0), 700,
-				0.22, 0.0009, 2.0))
+	# 卫星：挂在母星 pivot 下，位置用「相对母星的偏移 × 放大倍数」。
+	#
+	# 为什么要放大偏移：行星半径被夸张了约 620 倍，而卫星轨道半径按真实比例
+	# 只有零点零几个单位 —— 木卫一轨道 0.028 单位，而木星的渲染半径是 2.9 个
+	# 单位，卫星会整个埋在行星里面。把偏移按**同一个倍数**放大，整个卫星系统
+	# 就被等比放大，内部几何比例保持正确（木卫一在 6.03 个木星半径处，真值）。
+	for b in eph.bodies:
+		var nm := String(b["name"])
+		if not eph.satellites.has(nm):
+			continue
+		var parent := String(eph.satellites[nm]["parent"])
+		if not planet_nodes.has(parent):
+			continue
+		_build_body(b, planet_nodes[parent])
+		_build_satellite_orbit(nm, parent)
 
 	# 探测器↔地球连线：这就是 DSN 上下行走的那条路径。
 	link_line = MeshInstance3D.new()
@@ -339,54 +303,6 @@ func _all_meshes(node: Node) -> Array:
 	return out
 
 
-## 土星环。真实半径数据见 BodyData。
-func _build_saturn_rings(planet_radius: float) -> MeshInstance3D:
-	var inner := planet_radius * BodyData.RING_INNER
-	var outer := planet_radius * BodyData.RING_OUTER
-	var segs := 192
-
-	var verts := PackedVector3Array()
-	var uvs := PackedVector2Array()
-	var norms := PackedVector3Array()
-	var idx := PackedInt32Array()
-	for i in segs + 1:
-		var a := TAU * float(i) / float(segs)
-		var ca := cos(a)
-		var sa := sin(a)
-		verts.append(Vector3(ca * inner, 0.0, sa * inner))
-		uvs.append(Vector2(0.0, 0.0))
-		norms.append(Vector3.UP)
-		verts.append(Vector3(ca * outer, 0.0, sa * outer))
-		uvs.append(Vector2(1.0, 0.0))
-		norms.append(Vector3.UP)
-	for i in segs:
-		var b := i * 2
-		idx.append_array([b, b + 1, b + 2, b + 1, b + 3, b + 2])
-
-	var arr := []
-	arr.resize(Mesh.ARRAY_MAX)
-	arr[Mesh.ARRAY_VERTEX] = verts
-	arr[Mesh.ARRAY_TEX_UV] = uvs
-	arr[Mesh.ARRAY_NORMAL] = norms
-	arr[Mesh.ARRAY_INDEX] = idx
-	var am := ArrayMesh.new()
-	am.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
-
-	var mi := MeshInstance3D.new()
-	mi.mesh = am
-	mi.name = "SaturnRings"
-	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	var mat := ShaderMaterial.new()
-	mat.shader = load("res://shaders/rings.gdshader")
-	var bands := BodyData.ring_bands()
-	for k in bands:
-		mat.set_shader_parameter(k, float(bands[k]))
-	mat.set_shader_parameter("planet_radius", planet_radius)
-	mi.material_override = mat
-	saturn_rings = mi
-	return mi
-
-
 ## 轨迹带。用面向相机的三角带而不是线段 —— Godot 的线没有宽度。
 ##
 ## 每个路径点吐两个顶点（UV.y = ±1），顶点着色器沿「切线 × 视线」把它们
@@ -445,6 +361,187 @@ func _build_ribbon(points: PackedVector3Array, width: float,
 	mat.set_shader_parameter("trail_falloff", trail_falloff)
 	mi.material_override = mat
 	return mi
+
+
+## 建一个天体。parent 非空时表示这是卫星，挂在母星 pivot 下。
+func _build_body(b: Dictionary, parent: Node3D) -> void:
+	var nm := String(b["name"])
+	var prof: Dictionary = eph.profiles.get(nm, {})
+	var is_sat := parent != null
+
+	# 卫星的半径下限取得比行星小得多：行星下限 0.5 会把木卫一撑到木星的
+	# 0.17 倍（真值 0.025），比例失真 7 倍。0.06 让主要卫星落在真实比例上。
+	var floor_units := 0.06 if is_sat else 0.5
+	var real_units := float(b["mean_radius_km"]) / eph.au_km * AU_UNITS
+	var radius_units := clampf(real_units * PLANET_EXAGGERATION, floor_units, 8.0)
+
+	var pivot := Node3D.new()
+	pivot.name = nm
+	if is_sat:
+		parent.add_child(pivot)
+	else:
+		system_root.add_child(pivot)
+
+	var tilt := Node3D.new()
+	tilt.rotation_degrees = Vector3(0, 0, float(prof.get("obliquity_deg", 0.0)))
+	pivot.add_child(tilt)
+
+	var node := MeshInstance3D.new()
+	var mesh := SphereMesh.new()
+	mesh.radius = radius_units
+	mesh.height = radius_units * 2.0
+	mesh.radial_segments = 48 if not is_sat else 32
+	mesh.rings = 24 if not is_sat else 16
+	node.mesh = mesh
+	node.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+
+	var sc: Array = prof.get("surface_color", [0.7, 0.7, 0.7])
+	var col := Color(float(sc[0]), float(sc[1]), float(sc[2]))
+	var mat := ShaderMaterial.new()
+	mat.shader = load("res://shaders/planet.gdshader")
+	mat.set_shader_parameter("base_color", col)
+	mat.set_shader_parameter("kind", KIND_ID.get(String(prof.get("kind", "rocky")), 0))
+	var ac: Array = prof.get("atmosphere_color", [0.5, 0.7, 1.0])
+	mat.set_shader_parameter("atmo_color", Color(float(ac[0]), float(ac[1]), float(ac[2])))
+	mat.set_shader_parameter("atmo_power", float(prof.get("atmosphere_power", 0.0)))
+	match nm:
+		"jupiter":
+			mat.set_shader_parameter("band_tint", Color(0.62, 0.38, 0.24))
+			mat.set_shader_parameter("band_freq", 11.0)
+			mat.set_shader_parameter("spot_size", 0.30)
+			mat.set_shader_parameter("spot_color", Color(0.80, 0.34, 0.20))
+		"saturn":
+			mat.set_shader_parameter("band_tint", Color(0.72, 0.56, 0.34))
+			mat.set_shader_parameter("band_freq", 8.0)
+		"uranus":
+			mat.set_shader_parameter("band_freq", 4.0)
+		"neptune":
+			mat.set_shader_parameter("band_freq", 6.0)
+			mat.set_shader_parameter("spot_size", 0.26)
+			mat.set_shader_parameter("spot_lat", -0.42)
+			mat.set_shader_parameter("spot_color", Color(0.10, 0.16, 0.42))
+	node.material_override = mat
+	tilt.add_child(node)
+
+	planet_nodes[nm] = pivot
+	planet_spin[nm] = node
+	if not is_sat and real_units > 0.0:
+		# 卫星轨道与环系共用这个放大倍数，保证内部比例正确。
+		body_magnify[nm] = radius_units / real_units
+
+	var rings: Array = prof.get("rings", [])
+	if not rings.is_empty():
+		tilt.add_child(_build_ring_system(nm, prof, radius_units))
+
+	if nm in ORBIT_BODIES:
+		system_root.add_child(_build_path_mesh(nm, jd_min, jd_max,
+			col.lerp(Color(0.35, 0.85, 1.0), 0.55), Color(0.55, 0.35, 1.0), 700,
+			0.22, 0.0009, 2.0))
+
+
+## 通用环系。土星 / 天王星 / 海王星共用一套，环带边界来自 Go 侧真实数据。
+func _build_ring_system(nm: String, prof: Dictionary, planet_radius_units: float) -> MeshInstance3D:
+	var bands: Array = prof["rings"]
+	var planet_km := float(prof["equatorial_radius_km"])
+	var floor_km := eph.ring_render_floor_km
+
+	# 整个环系的内外缘
+	var lo_km := INF
+	var hi_km := -INF
+	for band in bands:
+		lo_km = minf(lo_km, float(band["inner_km"]))
+		hi_km = maxf(hi_km, float(band["outer_km"]))
+
+	var inner := planet_radius_units * lo_km / planet_km
+	var outer := planet_radius_units * hi_km / planet_km
+	var segs := 256
+
+	var verts := PackedVector3Array()
+	var uvs := PackedVector2Array()
+	var norms := PackedVector3Array()
+	var idx := PackedInt32Array()
+	for i in segs + 1:
+		var a := TAU * float(i) / float(segs)
+		var ca := cos(a)
+		var sa := sin(a)
+		verts.append(Vector3(ca * inner, 0.0, sa * inner))
+		uvs.append(Vector2(0.0, 0.0)); norms.append(Vector3.UP)
+		verts.append(Vector3(ca * outer, 0.0, sa * outer))
+		uvs.append(Vector2(1.0, 0.0)); norms.append(Vector3.UP)
+	for i in segs:
+		var bi := i * 2
+		idx.append_array([bi, bi + 1, bi + 2, bi + 1, bi + 3, bi + 2])
+
+	var arr := []
+	arr.resize(Mesh.ARRAY_MAX)
+	arr[Mesh.ARRAY_VERTEX] = verts
+	arr[Mesh.ARRAY_TEX_UV] = uvs
+	arr[Mesh.ARRAY_NORMAL] = norms
+	arr[Mesh.ARRAY_INDEX] = idx
+	var am := ArrayMesh.new()
+	am.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
+
+	var mi := MeshInstance3D.new()
+	mi.mesh = am
+	mi.name = nm + "_rings"
+	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+
+	# 把环带打包成纹理送给着色器：一行像素，R 通道存不透明度。
+	# 这样任意多道环/缝都能表达，不必为每颗行星写一套 uniform。
+	var w := 1024
+	var img := Image.create(w, 1, false, Image.FORMAT_RF)
+	for x in w:
+		var r_km := lerpf(lo_km, hi_km, float(x) / float(w - 1))
+		var op := 0.0
+		for band in bands:
+			var b_lo := float(band["inner_km"])
+			var b_hi := float(band["outer_km"])
+			# 极窄的环按渲染下限加宽，否则任何缩放下都细于一个像素。
+			if b_hi - b_lo < floor_km:
+				var mid := (b_lo + b_hi) * 0.5
+				b_lo = mid - floor_km * 0.5
+				b_hi = mid + floor_km * 0.5
+			if r_km >= b_lo and r_km <= b_hi:
+				if bool(band.get("is_gap", false)):
+					op = minf(op, float(band["opacity"]))
+				else:
+					op = maxf(op, float(band["opacity"]))
+		img.set_pixel(x, 0, Color(op, 0, 0))
+	var tex := ImageTexture.create_from_image(img)
+
+	var rt: Array = prof.get("ring_tint", [0.86, 0.79, 0.66])
+	var mat := ShaderMaterial.new()
+	mat.shader = load("res://shaders/rings.gdshader")
+	mat.set_shader_parameter("ring_color", Color(float(rt[0]), float(rt[1]), float(rt[2])))
+	mat.set_shader_parameter("band_lut", tex)
+	mat.set_shader_parameter("planet_radius", planet_radius_units)
+	mi.material_override = mat
+	return mi
+
+
+## 卫星轨道环。用 Go 侧导出的开普勒要素画一圈。
+##
+## 只画轨道**不定位置** —— internal/orbit 的测试量过，这套要素在飞掠时刻的
+## 相位误差是半长轴的 19%–200%（因为飞掠离 J2000 曆元 11–21 年）。轨道的
+## 尺寸和轨道面是准的（对照星历误差 0.00%–0.74%），相位不是。
+func _build_satellite_orbit(nm: String, parent: String) -> void:
+	var e: Dictionary = eph.satellites[nm]
+	var magnify: float = body_magnify.get(parent, 1.0)
+	var obl := float(eph.profiles.get(parent, {}).get("obliquity_deg", 0.0))
+	var period := float(e["period_days"])
+	var n := 220
+	var pts := PackedVector3Array()
+	var s := AU_UNITS / eph.au_km * magnify
+	for i in n:
+		var jd := float(e["epoch_jd"]) + period * float(i) / float(n - 1)
+		var off: Array = eph.satellite_offset_km(nm, jd, obl)
+		# 先在 double 里缩放到场景单位，再落到 Vector3。
+		pts.append(Vector3(float(off[0]) * s, float(off[2]) * s, -float(off[1]) * s))
+	var mi := _build_ribbon(pts, 0.0007,
+		Color(0.30, 0.70, 0.85), Color(0.55, 0.45, 0.90), 0.30, 1.0)
+	mi.name = nm + "_orbit"
+	planet_nodes[parent].add_child(mi)
+	satellite_orbits[nm] = mi
 
 
 func _build_path_mesh(body: String, from_jd: float, to_jd: float,
@@ -691,6 +788,34 @@ func _build_ui() -> void:
 	btn_mode.pressed.connect(_on_mode_pressed)
 	row.add_child(btn_mode)
 
+	# 相机锁定目标
+	var lbl := Label.new()
+	lbl.text = "  相机锁定"
+	row.add_child(lbl)
+	btn_focus = OptionButton.new()
+	btn_focus.add_item("太阳")
+	btn_focus.set_item_metadata(btn_focus.item_count - 1, "")
+	btn_focus.add_item("★ 跟随旅行者2号")
+	btn_focus.set_item_metadata(btn_focus.item_count - 1, "voyager2")
+	# 行星在前，卫星按母星缩进排在后面
+	for b in eph.bodies:
+		var nm := String(b["name"])
+		if bool(b["is_spacecraft"]) or eph.satellites.has(nm):
+			continue
+		btn_focus.add_item(String(b["label"]))
+		btn_focus.set_item_metadata(btn_focus.item_count - 1, nm)
+	for b in eph.bodies:
+		var nm2 := String(b["name"])
+		if not eph.satellites.has(nm2):
+			continue
+		var parent_label := String(eph.body_by_name.get(
+			String(eph.satellites[nm2]["parent"]), {}).get("label", ""))
+		btn_focus.add_item("    %s · %s" % [parent_label, String(b["label"])])
+		btn_focus.set_item_metadata(btn_focus.item_count - 1, nm2)
+	btn_focus.item_selected.connect(func(i: int) -> void:
+		_set_focus(String(btn_focus.get_item_metadata(i))))
+	row.add_child(btn_focus)
+
 	for ev in eph.events:
 		var b := Button.new()
 		b.text = JDTime.format_date_short(float(ev["jd"]))
@@ -742,9 +867,10 @@ func _set_mode(m: ViewMode) -> void:
 	system_root.visible = (m == ViewMode.SYSTEM)
 	craft_root.visible = (m == ViewMode.CRAFT)
 	if m == ViewMode.SYSTEM:
-		# 自动取景：按探测器当前距离取，免得一进场是一片空旷。
-		var d := JDTime.vec_len(eph.state_at("voyager2", jd_now)["pos"]) / eph.au_km * AU_UNITS
-		cam_dist = clampf(d * 1.5, 120.0, 6000.0)
+		if focus_target == "":
+			# 自动取景：按探测器当前距离取，免得一进场是一片空旷。
+			var d := JDTime.vec_len(eph.state_at("voyager2", jd_now)["pos"]) / eph.au_km * AU_UNITS
+			cam_dist = clampf(d * 1.5, 120.0, 6000.0)
 		btn_mode.text = "切到探测器特写"
 	else:
 		cam_dist = 34.0
@@ -780,9 +906,13 @@ func _refresh() -> void:
 	var in_range: bool = probe["in_range"]
 
 	for name_str in planet_nodes:
-		var st := eph.state_at(name_str, jd_now)
-		planet_nodes[name_str].position = _to_units(st["pos"])
-		planet_nodes[name_str].visible = st["in_range"]
+		var pv: Node3D = planet_nodes[name_str]
+		if eph.satellites.has(name_str):
+			_place_satellite(name_str, pv)
+		else:
+			var st := eph.state_at(name_str, jd_now)
+			pv.position = _to_units(st["pos"])
+			pv.visible = st["in_range"]
 		_spin_body(name_str)
 
 	probe_root.position = _to_units(probe["pos"])
@@ -929,6 +1059,32 @@ func _scale_markers() -> void:
 		probe_marker.scale = Vector3.ONE * clampf(cam_dist * 0.0075, 1.0, 46.0)
 
 
+## 卫星定位。
+##
+## 位置一律取自**星历**（真实定轨数据），不用开普勒要素 —— internal/orbit
+## 的测试量过，那套要素在飞掠时刻的相位误差高达半长轴的 200%，也就是把卫星
+## 画到行星的另一侧。要素只用来画轨道环。
+##
+## 但星历本身也有前提：木卫一 1.77 天一圈，日采样只有 0.56 个样本每圈，
+## 插出来是混叠的垃圾。所以采样不足 8 个样本每圈时**隐藏卫星本体**，只留
+## 轨道环 —— 宁可不画，也不画错。四次飞掠窗口有 30 分钟采样，那里是准的。
+func _place_satellite(nm: String, pivot: Node3D) -> void:
+	var parent := String(eph.satellites[nm]["parent"])
+	var ps := eph.state_at(parent, jd_now)
+	var ms := eph.state_at(nm, jd_now)
+	var resolved: bool = eph.satellite_position_is_resolved(nm, jd_now)
+	pivot.visible = bool(ms["in_range"]) and bool(ps["in_range"]) and resolved
+	if not pivot.visible:
+		return
+	# 相对母星的偏移，按母星的放大倍数等比放大。
+	var magnify: float = body_magnify.get(parent, 1.0)
+	var s := AU_UNITS / eph.au_km * magnify
+	var dx := float(ms["pos"][0]) - float(ps["pos"][0])
+	var dy := float(ms["pos"][1]) - float(ps["pos"][1])
+	var dz := float(ms["pos"][2]) - float(ps["pos"][2])
+	pivot.position = Vector3(dx * s, dz * s, -dy * s)
+
+
 ## 天体自转。
 ##
 ## 自转**速率**用真实的恒星自转周期（NASA Planetary Fact Sheet），负号为逆行
@@ -941,7 +1097,7 @@ func _scale_markers() -> void:
 func _spin_body(name_str: String) -> void:
 	if not planet_spin.has(name_str):
 		return
-	var hours: float = float(BodyData.ROTATION_HOURS.get(name_str, 0.0))
+	var hours: float = float(eph.profiles.get(name_str, {}).get("rotation_hours", 0.0))
 	if absf(hours) < 1e-6:
 		return
 	var turns := (jd_now - jd_min) * 24.0 / hours
@@ -1020,17 +1176,64 @@ func _update_camera() -> void:
 		_scale_markers()
 	var target := craft_focus
 	if mode == ViewMode.SYSTEM:
-		target = probe_root.position * 0.35
+		target = _focus_position()
 		if _shot_focus_probe:
-			target = probe_root.position
+			target = probe_root.global_position
 		elif _shot_focus_sun:
 			target = Vector3.ZERO
 		elif _shot_focus_body != "" and planet_nodes.has(_shot_focus_body):
-			target = planet_nodes[_shot_focus_body].position
+			target = (planet_nodes[_shot_focus_body] as Node3D).global_position
 	var dir := Vector3(
 		cos(cam_pitch) * sin(cam_yaw), sin(cam_pitch), cos(cam_pitch) * cos(cam_yaw))
 	camera.position = target + dir * cam_dist
 	camera.look_at(target, Vector3.UP)
+
+
+## 当前相机锁定的目标位置。
+##
+## focus_target 取值：""（太阳/原点）、"voyager2"（跟随探测器）、或任意
+## 天体名（含卫星）。卫星是母星 pivot 的子节点，所以要取 global_position。
+func _focus_position() -> Vector3:
+	if focus_target == "":
+		return Vector3.ZERO
+	if focus_target == "voyager2":
+		return probe_root.global_position
+	if planet_nodes.has(focus_target):
+		var n: Node3D = planet_nodes[focus_target]
+		if n.visible:
+			return n.global_position
+	return Vector3.ZERO
+
+
+## 切换锁定目标，并把相机距离调到能框住它的量级。
+func _set_focus(target: String) -> void:
+	focus_target = target
+	# 按目标的渲染尺寸自动取景，免得锁到月球却还是全太阳系的视距。
+	var d := 2400.0
+	if target == "voyager2":
+		d = 26.0
+	elif target != "" and eph.profiles.has(target):
+		var prof: Dictionary = eph.profiles[target]
+		var body: Dictionary = eph.body_by_name.get(target, {})
+		var real_units := float(body.get("mean_radius_km", 1000.0)) / eph.au_km * AU_UNITS
+		var floor_units: float = 0.06 if eph.satellites.has(target) else 0.5
+		var r := clampf(real_units * PLANET_EXAGGERATION, floor_units, 8.0)
+		# 有环的话要把环也框进来
+		var span := r
+		var rings: Array = prof.get("rings", [])
+		if not rings.is_empty():
+			var hi := 0.0
+			for band in rings:
+				hi = maxf(hi, float(band["outer_km"]))
+			span = r * hi / float(prof["equatorial_radius_km"])
+		d = maxf(span * 4.0, 1.2)
+	cam_dist = d
+	if btn_focus != null:
+		for i in btn_focus.item_count:
+			if String(btn_focus.get_item_metadata(i)) == target:
+				btn_focus.selected = i
+				break
+	_update_camera()
 
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -1062,6 +1265,10 @@ func _unhandled_input(event: InputEvent) -> void:
 		var k := event as InputEventKey
 		if k.keycode == KEY_SPACE:
 			_on_play_pressed()
+		elif k.keycode == KEY_F:
+			_set_focus("voyager2")
+		elif k.keycode == KEY_ESCAPE:
+			_set_focus("")
 		elif k.keycode == KEY_TAB:
 			_on_mode_pressed()
 
@@ -1329,12 +1536,18 @@ func _run_screenshot_harness() -> void:
 		{"name": "11_saturn", "jd": _event_jd("1981-08-26"), "mode": ViewMode.SYSTEM,
 			"dist": 24.0, "focus_body": "saturn", "deselect": true,
 			"yaw": 0.9, "pitch": 0.42},
-		{"name": "12_earth", "jd": jd_min + 900.0, "mode": ViewMode.SYSTEM,
-			"dist": 3.2, "focus_body": "earth", "deselect": true},
-		{"name": "13_uranus", "jd": _event_jd("1986-01-24"), "mode": ViewMode.SYSTEM,
-			"dist": 14.0, "focus_body": "uranus", "deselect": true},
-		{"name": "14_neptune", "jd": _event_jd("1989-08-25"), "mode": ViewMode.SYSTEM,
-			"dist": 14.0, "focus_body": "neptune", "deselect": true},
+		{"name": "12_uranus_rings", "jd": _event_jd("1986-01-24"), "mode": ViewMode.SYSTEM,
+			"dist": 22.0, "focus_body": "uranus", "deselect": true,
+			"yaw": 0.6, "pitch": 0.30},
+		{"name": "13_neptune_rings", "jd": _event_jd("1989-08-25"), "mode": ViewMode.SYSTEM,
+			"dist": 20.0, "focus_body": "neptune", "deselect": true,
+			"yaw": 1.2, "pitch": 0.35},
+		{"name": "14_jupiter_moons", "jd": _event_jd("1979-07-09"), "mode": ViewMode.SYSTEM,
+			"dist": 62.0, "focus_body": "jupiter", "deselect": true,
+			"yaw": 0.5, "pitch": 0.55},
+		{"name": "15_earth_moon", "jd": jd_min + 3000.0, "mode": ViewMode.SYSTEM,
+			"dist": 46.0, "focus_body": "earth", "deselect": true,
+			"yaw": 0.7, "pitch": 0.40},
 	]
 
 	for st in steps:
@@ -1480,4 +1693,46 @@ func _run_attitude_selftest() -> void:
 		worst = maxf(worst, deg)
 		print("ATTITUDE %s  天线轴与对地方向夹角 %.4f°" % [JDTime.format_date_short(jd), deg])
 	print("ATTITUDE_DONE 最大偏差 %.4f° %s" % [worst, "OK" if worst < 0.01 else "FAIL"])
+	get_tree().quit()
+
+
+## 卫星轨道解算的跨语言契约自检。
+##
+## 逐帧计算必须在 GDScript 里做，但物理模型的真相源在 Go（internal/orbit）。
+## 两份实现会静默漂移 —— 一个小数位打错、一次旋转顺序写反，画面上看不出来，
+## 但轨道就错了。所以 cmd/export 会把 Go 侧在若干固定历元的解算结果写进
+## metadata.json，这里逐点比对。
+##   Godot --headless --path . -- --orbittest
+func _run_orbit_selftest() -> void:
+	var checks: Array = eph.metadata.get("satellite_check", [])
+	if checks.is_empty():
+		print("ORBITTEST FAIL 数据包里没有契约基准点，先跑 go run ./cmd/export")
+		get_tree().quit()
+		return
+	var worst := 0.0
+	var worst_name := ""
+	var fails := 0
+	for c in checks:
+		var nm := String(c["name"])
+		var jd := float(c["jd"])
+		var obl := float(c["obliquity_deg"])
+		var want: Array = c["offset_km"]
+		var got: Array = eph.satellite_offset_km(nm, jd, obl)
+		# 比对必须在 double 里做，不能过 Vector3。
+		var ex := float(got[0]) - float(want[0])
+		var ey := float(got[1]) - float(want[1])
+		var ez := float(got[2]) - float(want[2])
+		var d := sqrt(ex * ex + ey * ey + ez * ez)
+		# 相对半长轴的误差
+		var a := float(eph.satellites[nm]["semi_major_km"])
+		var rel := d / a
+		if rel > worst:
+			worst = rel
+			worst_name = "%s @ jd %.2f" % [nm, jd]
+		if rel > 1e-9:
+			fails += 1
+			print("ORBITTEST FAIL %-9s jd %.2f  偏差 %.4f km = %s 个半长轴" % [
+				nm, jd, d, JDTime.sci(rel)])
+	print("ORBITTEST_DONE 基准点 %d  失配 %d  最大相对偏差 %s (%s)" % [
+		checks.size(), fails, JDTime.sci(worst), worst_name])
 	get_tree().quit()

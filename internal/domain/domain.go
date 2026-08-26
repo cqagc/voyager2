@@ -50,6 +50,11 @@ const (
 	BodyUranus   BodyID = 799
 	BodyNeptune  BodyID = 899
 
+	// Earth's Moon. Its 27.3-day period is well resolved even by daily
+	// sampling (about 27 samples per orbit), so unlike the inner planetary
+	// satellites it can be positioned from real ephemeris at any epoch.
+	BodyMoon BodyID = 301
+
 	// Flyby-relevant satellites.
 	BodyIo       BodyID = 501
 	BodyEuropa   BodyID = 502

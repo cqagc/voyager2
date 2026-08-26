@@ -85,6 +85,13 @@ var Bodies = []domain.Body{
 		MeanRadiusKm: 24622,
 	},
 	{
+		ID:           domain.BodyMoon,
+		Name:         "moon",
+		Label:        "月球",
+		MeanRadiusKm: 1737.4,
+		IsSpacecraft: false,
+	},
+	{
 		ID:           domain.BodyIo,
 		Name:         "io",
 		Label:        "木卫一",

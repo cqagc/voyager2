@@ -14,14 +14,12 @@ shader_type spatial;
 render_mode unshaded, cull_disabled, blend_mix, depth_draw_opaque, shadows_disabled;
 
 uniform vec3 ring_color : source_color = vec3(0.86, 0.79, 0.66);
-uniform float c_end = 0.28;
-uniform float b_end = 0.69;
-uniform float cassini_end = 0.76;
-uniform float encke_lo = 0.95;
-uniform float encke_hi = 0.95;
-uniform float keeler_lo = 0.995;
-uniform float keeler_hi = 0.996;
-// 行星半径（与环网格同一坐标系下的单位），用于计算本影
+// 环带查找表：一行像素，R 通道 = 该半径处的不透明度。
+//
+// 用纹理而不是一串 uniform，是为了同一套着色器同时服务土星（6 段）、
+// 天王星（13 段）和海王星（5 段）—— 环带数量差得远，写死 uniform 不现实。
+uniform sampler2D band_lut : filter_linear, repeat_disable;
+// 行星半径（与环网格同一坐标系），用于计算本影
 uniform float planet_radius = 1.0;
 
 varying vec3 world_pos;
@@ -57,20 +55,8 @@ void vertex() {
 void fragment() {
 	float r = UV.x;
 
-	// 各环的基础不透明度
-	float opacity;
-	if (r < c_end) {
-		opacity = 0.26;                                   // C 环：稀薄
-	} else if (r < b_end) {
-		opacity = 0.94;                                   // B 环：最致密
-	} else if (r < cassini_end) {
-		opacity = 0.08;                                   // 卡西尼缝
-	} else {
-		opacity = 0.62;                                   // A 环
-	}
-	// 恩克缝与基勒缝
-	if (r > encke_lo && r < encke_hi) { opacity *= 0.10; }
-	if (r > keeler_lo && r < keeler_hi) { opacity *= 0.12; }
+	// 从查找表取该半径处的不透明度
+	float opacity = texture(band_lut, vec2(clamp(r, 0.002, 0.998), 0.5)).r;
 
 	// 细纹结构
 	float detail = fine(r);
