@@ -10,3 +10,5 @@
 # 生成物：由 cmd/export 与 tools/model/assign.py 产出，不入库
 /godot/data/
 /godot/assets/*.glb
+# 构建产物
+/dist/
