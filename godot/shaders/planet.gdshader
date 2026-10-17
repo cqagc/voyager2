@@ -6,6 +6,24 @@
 shader_type spatial;
 render_mode unshaded, cull_back;
 
+// 贴图与程序化并存：有真实贴图的天体（太阳系九张 2K 图，见
+// godot/assets/textures/CREDITS.md）走贴图；Solar System Scope 那套图里
+// **没有**木卫一/二/三/四、土卫六、天卫五、海卫一，这七颗仍走下面的
+// 程序化分支，所以两条路都必须留着。
+//
+// 贴图是等距圆柱投影（equirectangular），SphereMesh 的 UV 正好是这个映射：
+// UV.y=0 在北极，UV.x 绕经度一周。经度零点没有对齐真实本初子午线 ——
+// 自转相位本来就是从 jd_min 起算的任意值（见 twin.gd _spin_body），
+// 这里不做也不该做天文级的经度声明。
+uniform sampler2D albedo_tex : source_color, filter_linear_mipmap;
+uniform bool use_tex = false;
+// 地球专用：夜面城市灯光与云层。分开传是因为它们的混合方式不同 ——
+// 灯光只在夜面出现，云层两面都在但只有昼面被照亮。
+uniform sampler2D night_tex : source_color, filter_linear_mipmap;
+uniform sampler2D cloud_tex : source_color, filter_linear_mipmap;
+uniform float night_strength = 0.0;
+uniform float cloud_strength = 0.0;
+
 // 0 rocky 1 venus 2 earth 3 mars 4 gas 5 ice 6 io 7 europa 8 titan 9 triton
 uniform int kind = 0;
 uniform vec3 base_color : source_color = vec3(0.7, 0.7, 0.7);
@@ -88,7 +106,9 @@ void fragment() {
 	float alat = abs(lat);
 	vec3 c = base_color;
 
-	if (kind == 0) {                 // 岩质：环形山 + 斑驳
+	if (use_tex) {
+		c = texture(albedo_tex, UV).rgb;
+	} else if (kind == 0) {                 // 岩质：环形山 + 斑驳
 		float cr = craters(n, 7.0);
 		float mott = fbm(n * 4.0, 4);
 		c = base_color * mix(0.72, 1.14, mott);
@@ -137,7 +157,7 @@ void fragment() {
 	}
 
 	// 木星大红斑：按经纬度定位的椭圆涡旋
-	if (spot_size > 0.001) {
+	if (spot_size > 0.001 && !use_tex) {
 		float plon = atan(n.z, n.x);
 		float plat = asin(clamp(lat, -1.0, 1.0));
 		float dlon = plon - spot_lon;
@@ -149,11 +169,24 @@ void fragment() {
 		c = mix(c, spot_color * mix(0.75, 1.25, swirl), sp);
 	}
 
+	// 云层：在受光计算之前叠到地表色上，这样云和地表一起被明暗项调制。
+	if (cloud_strength > 0.001) {
+		float cl = texture(cloud_tex, UV).r;
+		c = mix(c, vec3(1.0), clamp(cl * cloud_strength, 0.0, 1.0));
+	}
+
 	// 光照
 	vec3 L = normalize(-world_pos);
 	float ndl = dot(world_nrm, L);
 	float lit = smoothstep(-0.12, 0.30, ndl);
 	vec3 outc = c * (ambient + (1.0 - ambient) * lit);
+
+	// 夜面城市灯光：只在完全背光那一侧点亮，且必须是加法 —— 用 mix 会
+	// 把晨昏线附近的地表压暗，看起来像一圈脏边。
+	if (night_strength > 0.001) {
+		float night = 1.0 - smoothstep(-0.18, 0.12, ndl);
+		outc += texture(night_tex, UV).rgb * night_strength * night;
+	}
 
 	// 大气边缘辉光：只在昼侧轮廓上出现，夜侧只留极淡一线
 	float ndv = clamp(dot(normalize(NORMAL), normalize(VIEW)), 0.0, 1.0);

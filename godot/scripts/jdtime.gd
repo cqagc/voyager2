@@ -5,6 +5,14 @@ extends RefCounted
 const UNIX_JD := 2440587.5
 const C_KM_S := 299792.458
 
+## 当前真实时刻（系统 UTC）的儒略日。
+##
+## 时间轴的默认位置要取"现在"，不能取星历末端 —— 星历已经抓到了未来
+## （2060），拿末端当默认会让程序一进场就是几十年后。
+static func now_jd() -> float:
+	return UNIX_JD + Time.get_unix_time_from_system() / 86400.0
+
+
 ## 儒略日 -> [年, 月, 日, 时, 分]（公历）。
 static func to_calendar(jd: float) -> Array:
 	var z := floori(jd + 0.5)
@@ -72,3 +80,21 @@ static func duration_text(sec: float) -> String:
 	if sec < 172800.0:
 		return "%.2f 小时" % (sec / 3600.0)
 	return "%.2f 天" % (sec / 86400.0)
+
+## 儒略日所在的公历年。
+static func year_of(jd: float) -> int:
+	return int(to_calendar(jd)[0])
+
+## 某年 1 月 1 日 00:00 UT 的儒略日（格里历）。
+static func jd_of_year(year: int) -> float:
+	var y := year
+	var m := 1
+	var a := floori(float(y) / 100.0)
+	var b := 2 - a + floori(float(a) / 4.0)
+	return floor(365.25 * float(y + 4716)) + floor(30.6001 * float(m + 1)) \
+		+ 1.0 + float(b) - 1524.5
+
+## 只要时刻部分，"03:41 UTC"。
+static func format_time(jd: float) -> String:
+	var c := to_calendar(jd)
+	return "%02d:%02d UTC" % [c[3], c[4]]

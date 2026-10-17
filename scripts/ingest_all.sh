@@ -17,7 +17,10 @@ set -euo pipefail
 
 DB="${DB:-data/voyager2.db}"
 BIN="go run ./cmd/ingest"
-STOP="${STOP:-$(date +%F)}"
+# 默认抓到 2060 —— 不能用 $(date +%F)。抓到"今天"会让时间轴末端就是运行
+# 那一刻，播放条一到头就卡死、且必须天天重抓。Horizons 对 Voyager 2 和行星
+# 都能给未来星历（轨道已定得很死），一次抓够几十年。
+STOP="${STOP:-2060-01-01}"
 
 echo "==> 阶段 1/2：巡航基线，全天体，1 天步长"
 $BIN -db "$DB" -start 1977-08-20 -stop "$STOP" -step '1 d'

@@ -12,6 +12,12 @@
 extends Node3D
 
 const AU_UNITS := 10.0
+
+## 界面倍率的可选档位与存盘位置。倍率是乘进字号和布局像素的（见 HudTheme），
+## 换档要重建整层 HUD，所以做成离散档位而不是连续滑块。
+const UI_SCALES := [1.0, 1.5]
+const SETTINGS_PATH := "user://settings.cfg"
+
 ## 行星半径的夸张倍数是**随相机距离变化**的，不是常数。
 ##
 ## 为什么必须这样：场景里 1 AU = 10 个单位，而地球半径只有 0.000426 个单位。
@@ -47,6 +53,30 @@ const KIND_ID := {
 	"ice": 5, "io": 6, "europa": 7, "titan": 8, "triton": 9,
 }
 const TRAJECTORY_SAMPLES := 2400
+
+# 天体表面贴图。Solar System Scope 2K 全套（CC BY 4.0，见
+# godot/assets/textures/CREDITS.md）。
+#
+# 这里只有九张 —— 那套图里**没有**木卫一/二/三/四、土卫六、天卫五、海卫一，
+# 它们继续走 planet.gdshader 的程序化分支。别把这张表当"全部天体"。
+# 金星取大气贴图而不是表面贴图：可见光下看到的就是硫酸云顶，表面图是
+# 麦哲伦号雷达测高的产物，直接贴上去等于把云层剥了。
+const BODY_TEXTURE := {
+	"mercury": "res://assets/textures/2k_mercury.jpg",
+	"venus": "res://assets/textures/2k_venus_atmosphere.jpg",
+	"earth": "res://assets/textures/2k_earth_daymap.jpg",
+	"moon": "res://assets/textures/2k_moon.jpg",
+	"mars": "res://assets/textures/2k_mars.jpg",
+	"jupiter": "res://assets/textures/2k_jupiter.jpg",
+	"saturn": "res://assets/textures/2k_saturn.jpg",
+	"uranus": "res://assets/textures/2k_uranus.jpg",
+	"neptune": "res://assets/textures/2k_neptune.jpg",
+}
+const TEX_SUN := "res://assets/textures/2k_sun.jpg"
+const TEX_EARTH_NIGHT := "res://assets/textures/2k_earth_nightmap.jpg"
+const TEX_EARTH_CLOUDS := "res://assets/textures/2k_earth_clouds.jpg"
+const TEX_SATURN_RING := "res://assets/textures/2k_saturn_ring_alpha.png"
+const TEX_MILKY_WAY := "res://assets/textures/8k_stars_milky_way.jpg"
 
 enum ViewMode { SYSTEM, CRAFT }
 
@@ -105,22 +135,13 @@ var selected_component := ""
 var highlight_material: StandardMaterial3D
 var original_materials := {}
 
-# UI
-var ui: Control
-var lbl_date: Label
-var lbl_readout: RichTextLabel
-var lbl_component: RichTextLabel
-var lbl_dsn: Label
-var slider: HSlider
-var btn_play: Button
-var btn_mode: Button
+# UI —— 赛博朋克 HUD 全部在 hud.gd 里，这边只留接线用的引用
+var hud: Hud
+var ui_scale := 1.0
+var slider: HudTimeline
+var dsn_text := ""
 var dsn_request: HTTPRequest
 var dsn_active_craft: Array = []
-
-# 右栏：测控几何 / 链路预算 / 轨道
-var lbl_tracking: RichTextLabel
-var lbl_link: RichTextLabel
-var lbl_orbit: RichTextLabel
 var spark_dist: Sparkline
 var spark_power: Sparkline
 var spark_rx: Sparkline
@@ -132,8 +153,6 @@ var record_spin_axis := Vector3.RIGHT
 var record_center := Vector3.ZERO
 var record_angle := 0.0
 var record_spinning := false
-var lbl_record: RichTextLabel
-var record_panel: PanelContainer
 var audio: AudioStreamPlayer
 var audio_queue: PackedVector2Array = PackedVector2Array()
 var audio_cursor := 0
@@ -142,6 +161,14 @@ var audio_cursor := 0
 var link_line: MeshInstance3D
 var craft_focus := Vector3.ZERO
 var _drag_travel := 0.0
+var _touch_positions: Dictionary[int, Vector2] = {}
+var _multitouch_active := false
+var _pinch_distance := 0.0
+var _long_press_index := -1
+var _long_press_start := Vector2.ZERO
+var _long_press_position := Vector2.ZERO
+var _long_press_elapsed := 0.0
+var _long_press_consumed := false
 var _shot_focus_probe := false
 var _shot_focus_sun := false
 var _shot_focus_body := ""
@@ -150,9 +177,19 @@ var focus_target := ""
 var btn_focus: OptionButton
 var focus_note := ""
 var _syncing_slider := false
+var _probe_in_range := true
 
 
 func _ready() -> void:
+	# 数据包缺失时的 FATAL 屏没法靠正常流程截图（那时候 _ready 直接返回了），
+	# 给它一个专用钩子，方便和设计稿对图。
+	if "--fatalshot" in OS.get_cmdline_user_args():
+		fatal_error = "res://data/metadata.json 不存在"
+		_load_settings()
+		_build_ui()
+		_run_fatal_shot.call_deferred()
+		return
+
 	eph = Ephemeris.new()
 	var err := eph.load_bundle("res://data/metadata.json", "res://data/ephemeris.bin")
 	if err != "":
@@ -164,8 +201,10 @@ func _ready() -> void:
 	var span := eph.jd_span()
 	jd_min = span[0]
 	jd_max = span[1]
-	jd_now = jd_max
+	# 默认落在真实"现在"。星历现在覆盖到 2060，取末端会开在几十年后。
+	jd_now = clampf(JDTime.now_jd(), jd_min, jd_max)
 
+	_load_settings()
 	_build_environment()
 	_build_system_view()
 	_build_craft_view()
@@ -190,6 +229,10 @@ func _ready() -> void:
 		_run_scale_selftest.call_deferred()
 	if "--focustest" in OS.get_cmdline_user_args():
 		_run_focus_selftest.call_deferred()
+	if "--skytest" in OS.get_cmdline_user_args():
+		_run_sky_selftest.call_deferred()
+	if "--hudtest" in OS.get_cmdline_user_args():
+		_run_hud_selftest.call_deferred()
 	print("孪生体就绪：%d 天体，%d 组件，时间跨度 %s .. %s" % [
 		eph.bodies.size(), eph.components.size(),
 		JDTime.format_date_short(jd_min), JDTime.format_date_short(jd_max)])
@@ -197,8 +240,11 @@ func _ready() -> void:
 
 func _build_environment() -> void:
 	var env := Environment.new()
-	env.background_mode = Environment.BG_COLOR
+	env.background_mode = Environment.BG_SKY
 	env.background_color = Color(0.015, 0.017, 0.028)
+	env.sky = _build_sky()
+	# 环境光仍取常量色，不用 AMBIENT_SOURCE_SKY：让银河去照亮行星会把
+	# 夜面染成一片灰紫，而且亮度随相机朝向变 —— 一转视角行星就变色。
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
 	env.ambient_light_color = Color(0.30, 0.32, 0.38)
 	env.ambient_light_energy = 0.55
@@ -234,6 +280,79 @@ func _build_environment() -> void:
 	add_child(camera)
 
 
+## 天穹。银河全天图按银道 -> 黄道 -> 世界坐标对齐，见 shaders/sky.gdshader。
+func _build_sky() -> Sky:
+	var mat := ShaderMaterial.new()
+	mat.shader = load("res://shaders/sky.gdshader")
+	mat.set_shader_parameter("panorama", load(TEX_MILKY_WAY))
+	var rows := _galactic_rows()
+	mat.set_shader_parameter("gal_row0", rows[0])
+	mat.set_shader_parameter("gal_row1", rows[1])
+	mat.set_shader_parameter("gal_row2", rows[2])
+	var sky := Sky.new()
+	sky.sky_material = mat
+	# 天穹不参与辐照度烘焙（环境光走常量色），把烘焙尺寸压到最小省显存。
+	sky.radiance_size = Sky.RADIANCE_SIZE_32
+	sky.process_mode = Sky.PROCESS_MODE_REALTIME
+	return sky
+
+
+## 世界坐标（黄道 J2000，见 _to_units）-> 银道坐标的旋转矩阵，返回三个行向量。
+##
+## 复合三步，每步都是标准量，没有拟合值：
+##   1. 世界 -> 黄道：_to_units 把黄道 (x,y,z) 摆成 (x, z, -y)，逆变换是
+##      (gx, -gz, gy)。行列式 +1，是纯旋转，不含镜像 —— 这一点必须成立，
+##      否则银河会左右翻转而肉眼很难发现。
+##   2. 黄道 -> 赤道：绕 X 轴转黄赤交角 23.4392911°（IAU 2006，J2000）。
+##   3. 赤道 -> 银道：Hipparcos/ICRS 标准矩阵（银北极 RA 192.85948°、
+##      Dec +27.12825°，天北极银经 122.93192°）。
+##
+## 正确性由 --skytest 校验（银心落在贴图正中、黄北极落在 l=96.4°/b=+29.8°）。
+func _galactic_rows() -> Array:
+	# 赤道 -> 银道（ICRS，行优先）
+	var ag := [
+		Vector3(-0.0548755604162154, -0.8734370902348850, -0.4838350155487132),
+		Vector3(0.4941094278755837, -0.4448296299600112, 0.7469822444972189),
+		Vector3(-0.8676661490190047, -0.1980763734312015, 0.4559837761750669),
+	]
+	var eps := deg_to_rad(23.4392911)
+	var ce := cos(eps)
+	var se := sin(eps)
+	# 黄道 -> 赤道 绕 X，再右乘 世界 -> 黄道 的置换，一次算完
+	# 世界 -> 黄道: ecl = (w.x, -w.z, w.y)
+	# 黄道 -> 赤道: eq  = (e.x, ce*e.y - se*e.z, se*e.y + ce*e.z)
+	# 合成后作用在世界向量 w 上：
+	#   eq.x = w.x
+	#   eq.y = -ce*w.z - se*w.y
+	#   eq.z = -se*w.z + ce*w.y
+	var m := [
+		Vector3(1.0, 0.0, 0.0),
+		Vector3(0.0, -se, -ce),
+		Vector3(0.0, ce, -se),
+	]
+	var out := []
+	for i in 3:
+		var r: Vector3 = ag[i]
+		out.append(Vector3(
+			r.x * m[0].x + r.y * m[1].x + r.z * m[2].x,
+			r.x * m[0].y + r.y * m[1].y + r.z * m[2].y,
+			r.x * m[0].z + r.y * m[1].z + r.z * m[2].z))
+	return out
+
+
+## 世界方向 -> 银河贴图 UV。与 sky.gdshader 里的算式必须一致，--skytest 校验。
+func _galactic_uv(world_dir: Vector3) -> Vector2:
+	var rows := _galactic_rows()
+	var d := world_dir.normalized()
+	var r0: Vector3 = rows[0]
+	var r1: Vector3 = rows[1]
+	var r2: Vector3 = rows[2]
+	var g := Vector3(r0.dot(d), r1.dot(d), r2.dot(d)).normalized()
+	var l := atan2(g.y, g.x)
+	var b := asin(clampf(g.z, -1.0, 1.0))
+	return Vector2(fposmod(0.5 - l / TAU, 1.0), 0.5 + b / PI)
+
+
 func _build_system_view() -> void:
 	system_root = Node3D.new()
 	system_root.name = "SystemView"
@@ -249,6 +368,8 @@ func _build_system_view() -> void:
 	sun.mesh = sun_mesh
 	var sun_mat := ShaderMaterial.new()
 	sun_mat.shader = load("res://shaders/sun_surface.gdshader")
+	sun_mat.set_shader_parameter("albedo_tex", load(TEX_SUN))
+	sun_mat.set_shader_parameter("use_tex", true)
 	sun.material_override = sun_mat
 	system_root.add_child(sun)
 
@@ -448,6 +569,16 @@ func _build_body(b: Dictionary, parent: Node3D) -> void:
 	mat.shader = load("res://shaders/planet.gdshader")
 	mat.set_shader_parameter("base_color", col)
 	mat.set_shader_parameter("kind", KIND_ID.get(String(prof.get("kind", "rocky")), 0))
+	# 有真实贴图的走贴图，没有的（七颗卫星）保持程序化。kind 仍然照传：
+	# 贴图缺失时它就是唯一的外观依据，不能因为"现在用贴图了"就删掉。
+	if BODY_TEXTURE.has(nm):
+		mat.set_shader_parameter("albedo_tex", load(BODY_TEXTURE[nm]))
+		mat.set_shader_parameter("use_tex", true)
+	if nm == "earth":
+		mat.set_shader_parameter("night_tex", load(TEX_EARTH_NIGHT))
+		mat.set_shader_parameter("night_strength", 0.85)
+		mat.set_shader_parameter("cloud_tex", load(TEX_EARTH_CLOUDS))
+		mat.set_shader_parameter("cloud_strength", 0.80)
 	var ac: Array = prof.get("atmosphere_color", [0.5, 0.7, 1.0])
 	mat.set_shader_parameter("atmo_color", Color(float(ac[0]), float(ac[1]), float(ac[2])))
 	mat.set_shader_parameter("atmo_power", float(prof.get("atmosphere_power", 0.0)))
@@ -561,6 +692,13 @@ func _build_ring_system(nm: String, prof: Dictionary, planet_radius_units: float
 	mat.set_shader_parameter("ring_color", Color(float(rt[0]), float(rt[1]), float(rt[2])))
 	mat.set_shader_parameter("band_lut", tex)
 	mat.set_shader_parameter("planet_radius", planet_radius_units)
+	# 只有土星有对应贴图。贴图的径向跨度和我们的 LUT 基本一致：卡西尼缝在
+	# 贴图上的 alpha 低谷落在 u≈0.70，而按 internal/bodies 的环带数据算
+	# (117580-74658)/(136775-74658)=0.691 —— 两者对得上，才敢把 U 直接当
+	# 归一化半径用。
+	if nm == "saturn":
+		mat.set_shader_parameter("color_tex", load(TEX_SATURN_RING))
+		mat.set_shader_parameter("use_color_tex", true)
 	mi.material_override = mat
 	return mi
 
@@ -720,197 +858,56 @@ func _index_components(node: Node) -> void:
 func _build_ui() -> void:
 	var layer := CanvasLayer.new()
 	add_child(layer)
-	ui = Control.new()
-	ui.set_anchors_preset(Control.PRESET_FULL_RECT)
-	ui.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	layer.add_child(ui)
+	hud = Hud.new()
+	layer.add_child(hud)
 
 	if fatal_error != "":
-		var err := Label.new()
-		err.text = "数据包加载失败\n\n%s\n\n先运行：\n  go run ./cmd/ingest\n  blender --background --factory-startup --python tools/model/assign.py -- --mode export\n  go run ./cmd/export" % fatal_error
-		err.position = Vector2(40, 40)
-		err.add_theme_font_size_override("font_size", 16)
-		ui.add_child(err)
+		hud.build_fatal(fatal_error)
 		return
 
-	# 左上：状态读数
-	var left := PanelContainer.new()
-	left.position = Vector2(16, 12)
-	left.custom_minimum_size = Vector2(430, 0)
-	left.mouse_filter = Control.MOUSE_FILTER_STOP
-	ui.add_child(left)
-	var vb := VBoxContainer.new()
-	left.add_child(vb)
-
-	lbl_date = Label.new()
-	lbl_date.add_theme_font_size_override("font_size", 21)
-	vb.add_child(lbl_date)
-
-	lbl_readout = RichTextLabel.new()
-	lbl_readout.bbcode_enabled = true
-	lbl_readout.fit_content = true
-	lbl_readout.custom_minimum_size = Vector2(410, 0)
-	lbl_readout.scroll_active = false
-	vb.add_child(lbl_readout)
-
-	lbl_dsn = Label.new()
-	lbl_dsn.text = "DSN 链路：未查询"
-	vb.add_child(lbl_dsn)
-	var btn_dsn := Button.new()
-	btn_dsn.text = "查询 DSN 实时链路"
-	btn_dsn.pressed.connect(_on_dsn_pressed)
-	vb.add_child(btn_dsn)
-
-	# 左栏底部：功率曲线
-	spark_power = Sparkline.new()
-	spark_power.custom_minimum_size = Vector2(410, 56)
-	spark_power.caption = "RTG 输出 1977 → 2035（模型推演）"
-	vb.add_child(spark_power)
-
-	spark_dist = Sparkline.new()
-	spark_dist.custom_minimum_size = Vector2(410, 56)
-	spark_dist.caption = "距地球距离 1977 → 2026"
-	spark_dist.line_color = Color(0.62, 0.86, 0.68)
-	spark_dist.fill_color = Color(0.35, 0.65, 0.45, 0.20)
-	vb.add_child(spark_dist)
-
-	# 右栏
-	var right_scroll := ScrollContainer.new()
-	right_scroll.set_anchors_preset(Control.PRESET_RIGHT_WIDE)
-	right_scroll.offset_left = -486
-	right_scroll.offset_top = 16
-	right_scroll.offset_right = -16
-	right_scroll.offset_bottom = -112
-	right_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	right_scroll.mouse_filter = Control.MOUSE_FILTER_STOP
-	ui.add_child(right_scroll)
-	var right_col := VBoxContainer.new()
-	right_col.custom_minimum_size = Vector2(455, 0)
-	right_col.add_theme_constant_override("separation", 6)
-	right_scroll.add_child(right_col)
-
-	record_panel = PanelContainer.new()
-	record_panel.mouse_filter = Control.MOUSE_FILTER_STOP
-	record_panel.visible = false
-	right_col.add_child(record_panel)
-
-	lbl_tracking = _panel_label(right_col, 450)
-	lbl_link = _panel_label(right_col, 450)
-
-	spark_rx = Sparkline.new()
-	spark_rx.custom_minimum_size = Vector2(450, 52)
-	spark_rx.caption = "DSN 接收信号强度 dBm（自由空间路径损耗）"
-	spark_rx.line_color = Color(0.95, 0.72, 0.45)
-	spark_rx.fill_color = Color(0.75, 0.50, 0.25, 0.20)
-	right_col.add_child(spark_rx)
-
-	lbl_orbit = _panel_label(right_col, 450)
-	lbl_component = _panel_label(right_col, 450)
-
-	var rv := VBoxContainer.new()
-	record_panel.add_child(rv)
-	var rscroll := ScrollContainer.new()
-	rscroll.custom_minimum_size = Vector2(450, 300)
-	rscroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	rv.add_child(rscroll)
-	lbl_record = RichTextLabel.new()
-	lbl_record.bbcode_enabled = true
-	lbl_record.fit_content = true
-	lbl_record.custom_minimum_size = Vector2(432, 0)
-	lbl_record.scroll_active = false
-	rscroll.add_child(lbl_record)
-	var rrow := HBoxContainer.new()
-	rv.add_child(rrow)
-	var b_tone := Button.new()
-	b_tone.text = "▶ 1000 Hz 校准音"
-	b_tone.pressed.connect(_play_calibration)
-	rrow.add_child(b_tone)
-	var b_scan := Button.new()
-	b_scan.text = "▶ 图像扫描线编码"
-	b_scan.pressed.connect(_play_scanlines)
-	rrow.add_child(b_scan)
-	var b_spin := Button.new()
-	b_spin.text = "⟳ 转起来"
-	b_spin.pressed.connect(func() -> void: record_spinning = not record_spinning)
-	rrow.add_child(b_spin)
-
-	# 底部：时间轴
-	var bottom := PanelContainer.new()
-	bottom.set_anchors_preset(Control.PRESET_BOTTOM_WIDE)
-	bottom.position = Vector2(0, -104)
-	bottom.mouse_filter = Control.MOUSE_FILTER_STOP
-	ui.add_child(bottom)
-	var bv := VBoxContainer.new()
-	bottom.add_child(bv)
-
-	slider = HSlider.new()
-	slider.min_value = jd_min
-	slider.max_value = jd_max
-	slider.step = 0.01
-	slider.value = jd_now
-	slider.custom_minimum_size = Vector2(0, 26)
-	slider.value_changed.connect(_on_slider_changed)
-	bv.add_child(slider)
-
-	var row := HBoxContainer.new()
-	bv.add_child(row)
-	btn_play = Button.new()
-	btn_play.text = "▶ 播放"
-	btn_play.pressed.connect(_on_play_pressed)
-	row.add_child(btn_play)
-	btn_mode = Button.new()
-	btn_mode.text = "切到探测器特写"
-	btn_mode.pressed.connect(_on_mode_pressed)
-	row.add_child(btn_mode)
-
-	# 相机锁定目标
-	var lbl := Label.new()
-	lbl.text = "  相机锁定"
-	row.add_child(lbl)
-	btn_focus = OptionButton.new()
-	btn_focus.add_item("太阳")
-	btn_focus.set_item_metadata(btn_focus.item_count - 1, "")
-	btn_focus.add_item("★ 跟随旅行者2号")
-	btn_focus.set_item_metadata(btn_focus.item_count - 1, "voyager2")
-	# 行星在前，卫星按母星缩进排在后面
+	# 相机锁定的候选目标：太阳、探测器，然后行星在前、卫星按母星缩进排后面。
+	var focus_items: Array = [
+		{"label": "太阳", "meta": ""},
+		{"label": "★ 跟随旅行者2号", "meta": "voyager2"},
+	]
 	for b in eph.bodies:
 		var nm := String(b["name"])
 		if bool(b["is_spacecraft"]) or eph.satellites.has(nm):
 			continue
-		btn_focus.add_item(String(b["label"]))
-		btn_focus.set_item_metadata(btn_focus.item_count - 1, nm)
+		focus_items.append({"label": String(b["label"]), "meta": nm})
 	for b in eph.bodies:
 		var nm2 := String(b["name"])
 		if not eph.satellites.has(nm2):
 			continue
 		var parent_label := String(eph.body_by_name.get(
 			String(eph.satellites[nm2]["parent"]), {}).get("label", ""))
-		btn_focus.add_item("  └ %s（%s 的卫星）" % [String(b["label"]), parent_label])
-		btn_focus.set_item_metadata(btn_focus.item_count - 1, nm2)
+		focus_items.append({
+			"label": "  └ %s（%s 的卫星）" % [String(b["label"]), parent_label],
+			"meta": nm2,
+		})
+
+	hud.build(jd_min, jd_max, eph.events, focus_items, "%d 目标" % focus_items.size())
+	slider = hud.timeline
+	btn_focus = hud.btn_focus
+	spark_power = hud.spark_power
+	spark_dist = hud.spark_dist
+	spark_rx = hud.spark_rx
+
+	slider.value_changed.connect(_on_slider_changed)
+	slider.value = jd_now
+	hud.play_pressed.connect(_on_play_pressed)
+	hud.mode_pressed.connect(func(craft: bool) -> void:
+		_set_mode(ViewMode.CRAFT if craft else ViewMode.SYSTEM))
+	hud.focus_probe_pressed.connect(func() -> void: _set_focus("voyager2"))
+	hud.focus_sun_pressed.connect(func() -> void: _set_focus(""))
+	hud.dsn_pressed.connect(_on_dsn_pressed)
+	hud.tone_pressed.connect(_play_calibration)
+	hud.scan_pressed.connect(_play_scanlines)
+	hud.spin_pressed.connect(func() -> void: record_spinning = not record_spinning)
 	btn_focus.item_selected.connect(func(i: int) -> void:
 		_set_focus(String(btn_focus.get_item_metadata(i))))
-	row.add_child(btn_focus)
-
-	for ev in eph.events:
-		var b := Button.new()
-		b.text = JDTime.format_date_short(float(ev["jd"]))
-		b.tooltip_text = String(ev["label"])
-		var target := float(ev["jd"])
-		b.pressed.connect(func() -> void: _seek(target))
-		row.add_child(b)
-
-
-func _panel_label(parent: Node, width: int) -> RichTextLabel:
-	var pc := PanelContainer.new()
-	pc.mouse_filter = Control.MOUSE_FILTER_STOP
-	parent.add_child(pc)
-	var rt := RichTextLabel.new()
-	rt.bbcode_enabled = true
-	rt.fit_content = true
-	rt.custom_minimum_size = Vector2(width, 0)
-	rt.scroll_active = false
-	pc.add_child(rt)
-	return rt
+	hud.ui_scale_picked.connect(_set_ui_scale)
+	hud.set_ui_scale_selection(ui_scale)
 
 
 func _on_slider_changed(v: float) -> void:
@@ -922,7 +919,7 @@ func _on_slider_changed(v: float) -> void:
 
 func _on_play_pressed() -> void:
 	playing = not playing
-	btn_play.text = "⏸ 暂停" if playing else "▶ 播放"
+	hud.set_playing(playing)
 
 
 func _on_mode_pressed() -> void:
@@ -946,16 +943,17 @@ func _set_mode(m: ViewMode) -> void:
 			# 自动取景：按探测器当前距离取，免得一进场是一片空旷。
 			var d := JDTime.vec_len(eph.state_at("voyager2", jd_now)["pos"]) / eph.au_km * AU_UNITS
 			cam_dist = clampf(d * 1.5, 120.0, 6000.0)
-		btn_mode.text = "切到探测器特写"
+		hud.set_mode(false)
 	else:
 		cam_dist = 34.0
-		btn_mode.text = "切回太阳系视图"
+		hud.set_mode(true)
 	_update_camera()
 
 
 func _process(delta: float) -> void:
 	if fatal_error != "":
 		return
+	_update_long_press(delta)
 	_pump_audio()
 	if record_spinning and record_node != null:
 		# 唱片实际转速 16⅔ rpm，这里按真实转速转，慢得有点催眠但是对的。
@@ -968,7 +966,7 @@ func _process(delta: float) -> void:
 		if jd_now >= jd_max:
 			jd_now = jd_max
 			playing = false
-			btn_play.text = "▶ 播放"
+			hud.set_playing(false)
 		_syncing_slider = true
 		slider.value = jd_now
 		_syncing_slider = false
@@ -1007,105 +1005,139 @@ func _refresh() -> void:
 	var link := Geometry.link_budget(float(trk["range_km"]))
 	var orb := Geometry.orbit(probe)
 
-	lbl_date.text = JDTime.format_date(jd_now)
-
-	# ---- 左栏：任务状态 ----
-	# 注意用的是**距地球**的光时，不是距太阳的。指令和遥测走的是地球这条线，
+	# ---- HUD 数值 ----
+	# 注意光时用的是**距地球**的，不是距太阳的。指令和遥测走的是地球这条线，
 	# 早先按距日算是错的（143 AU 时两者差约 1 AU，即 8 分多钟）。
-	var lines := PackedStringArray()
-	lines.append("[color=#8fa3bf]距地球[/color]  %.3f AU   (%s km)" % [
-		float(trk["range_au"]), JDTime.sci(float(trk["range_km"]))])
-	lines.append("[color=#8fa3bf]距离变化率[/color]  %+.4f km/s   [color=#6f7f96]← DSN 的多普勒观测量[/color]"
-		% float(trk["range_rate_kms"]))
-	lines.append("[color=#8fa3bf]单程光时[/color]  %s      [color=#8fa3bf]往返[/color]  %s" % [
-		JDTime.duration_text(float(trk["owlt_sec"])),
-		JDTime.duration_text(float(trk["rtlt_sec"]))])
-	lines.append("[color=#8fa3bf]距太阳[/color]  %.2f AU    [color=#8fa3bf]日心速度[/color]  %.3f km/s" % [
-		helio_km / eph.au_km, speed])
-	lines.append("")
-	lines.append("[color=#8fa3bf]RTG 输出[/color]  %.1f W   [color=#d98a3a]〔模型推演，非遥测〕[/color]" % pw["watts"])
-	lines.append("  燃料剩余 %.1f%%   转换器效率 %.1f%%" % [
-		float(pw["fuel_fraction"]) * 100.0, float(pw["converter_fraction"]) * 100.0])
-	lines.append("  [color=#6f7f96]两者几乎相等：功率损失约一半来自钚衰变、一半来自热电偶老化[/color]")
-	lines.append("")
-	if in_range:
-		lines.append("[color=#5f9e6f]轨迹数据：归档实测 + Hermite 插值[/color]")
-	else:
-		lines.append("[color=#b06060]该时刻超出星历覆盖范围[/color]")
-	lines.append("[color=#8fa3bf]相机锁定[/color]  %s" % _focus_label())
-	if eph.satellites.has(focus_target):
-		var src_ok: bool = bool(_orbit_from_ephemeris.get(focus_target, false))
-		lines.append("  轨道环数据源：%s" % (
-			"[color=#5f9e6f]归档星历（精确，含轨道面进动）[/color]" if src_ok
-			else "[color=#d98a3a]开普勒要素示意（相位不可信）[/color]"))
-	if focus_note != "":
-		lines.append("[color=#d98a3a]%s[/color]" % focus_note)
-	lbl_readout.text = "\n".join(lines)
+	var range_au := float(trk["range_au"])
+	var owlt := float(trk["owlt_sec"])
+	var rtlt := float(trk["rtlt_sec"])
+	var helio_au := helio_km / eph.au_km
+	var sep := float(trk["sep_deg"])
 
-	# ---- 右栏：测控几何 ----
-	var t := PackedStringArray()
-	t.append("[b]测控几何[/b]  [color=#6f7f96]全部由星历推导[/color]")
-	t.append("[color=#8fa3bf]赤经[/color] %.3f°    [color=#8fa3bf]赤纬[/color] %+.3f°   [color=#6f7f96]← 天线往哪儿指[/color]"
-		% [float(trk["ra_deg"]), float(trk["dec_deg"])])
-	t.append("[color=#8fa3bf]X 波段多普勒[/color]  %+.1f Hz  (8.420 GHz 载波)" % float(trk["doppler_hz"]))
-	t.append("[color=#8fa3bf]日-地-探夹角 SEP[/color]  %.2f°%s" % [
-		float(trk["sep_deg"]),
-		"   [color=#c07050]← 接近太阳合，链路受太阳噪声压制[/color]" if float(trk["sep_deg"]) < 5.0 else ""])
-	t.append("")
-	t.append("[color=#8fa3bf]DSN 测站可见性[/color]  [color=#6f7f96](中天高度 > 10° 才够得着)[/color]")
-	for st_v in Geometry.visible_stations(float(trk["dec_deg"])):
-		var ok: bool = st_v["visible"]
-		t.append("  %s %-16s 中天 %+6.1f°  %s" % [
-			"[color=#5f9e6f]●[/color]" if ok else "[color=#7a4a4a]○[/color]",
-			String(st_v["name"]), float(st_v["culmination_deg"]),
-			"[color=#5f9e6f]可跟踪[/color]" if ok else "[color=#8a6060]地平线以下[/color]"])
-	lbl_tracking.text = "\n".join(t)
+	var vals := {
+		"date": JDTime.format_date_short(jd_now),
+		"time": JDTime.format_time(jd_now),
+		"jdline": "JD %.4f TDB  ·  任务第 %d 天" % [jd_now, int(floor(jd_now - jd_min))],
+		"range_au": "%.7f" % range_au,
+		"range_km": "%s km" % JDTime.sci(float(trk["range_km"]), 5),
+		"range_rate": "%+.4f km/s" % float(trk["range_rate_kms"]),
+		"doppler": "↳ 这就是 DSN 的多普勒观测量 · X 波段 %+.1f Hz @ 8.420 GHz"
+			% float(trk["doppler_hz"]),
+		"helio": "%.2f" % helio_au,
+		"speed": "%.3f" % speed,
+		"watts": "%.1f" % float(pw["watts"]),
+		"fuel_pct": "%.1f%%" % (float(pw["fuel_fraction"]) * 100.0),
+		"conv_pct": "%.1f%%" % (float(pw["converter_fraction"]) * 100.0),
+		"ra": "%.3f°" % float(trk["ra_deg"]),
+		"dec": _typo_minus("%+.3f°" % float(trk["dec_deg"])),
+		"sep": "%.2f°" % sep,
+		"fspl": "%.1f" % float(link["fspl_db"]),
+		"rx": "%.2f" % float(link["rx_dbm"]),
+		"v_now": "%.3f" % float(orb["speed_kms"]),
+		"v_esc": "%.3f" % float(orb["v_escape_kms"]),
+	}
 
-	# ---- 右栏：链路预算 ----
-	var l := PackedStringArray()
-	l.append("[b]下行链路预算[/b]  [color=#6f7f96]18 W 行波管 + 3.7 m 碟 → DSN 70 m[/color]")
-	l.append("[color=#8fa3bf]自由空间路径损耗[/color]  %.1f dB" % float(link["fspl_db"]))
-	l.append("[color=#8fa3bf]DSN 接收信号[/color]  %.1f dBm" % float(link["rx_dbm"]))
-	l.append("[color=#6f7f96]损耗随距离平方增长 —— 这就是数据率从 115 kbps 一路降到 160 bps 的物理原因[/color]")
-	lbl_link.text = "\n".join(l)
+	# 光时的单位跟着量级走：飞掠木星时是分钟，现在是小时／天。
+	var op := _time_pair(owlt)
+	vals["owlt"] = op[0]
+	vals["owlt_unit"] = op[1]
+	var rp := _time_pair(rtlt)
+	vals["rtlt"] = rp[0]
+	vals["rtlt_unit"] = rp[1]
 
-	# ---- 右栏：轨道能量 ----
-	var o := PackedStringArray()
-	o.append("[b]日心轨道[/b]")
-	o.append("[color=#8fa3bf]当前速度[/color] %.3f km/s   [color=#8fa3bf]该处逃逸速度[/color] %.3f km/s" % [
-		float(orb["speed_kms"]), float(orb["v_escape_kms"])])
 	if bool(orb["escaping"]):
-		o.append("[color=#5f9e6f]已达逃逸条件[/color]，双曲剩余速度 %.3f km/s（永不返回）" % float(orb["v_inf_kms"]))
+		vals["v_inf"] = "双曲剩余速度 %.3f km/s · 永不返回" % float(orb["v_inf_kms"])
+		vals["escape"] = "已达逃逸条件 ESCAPE"
 	else:
-		o.append("[color=#c0a060]仍在束缚轨道上[/color]")
-	o.append("[color=#8fa3bf]日球层顶[/color]  %s  [color=#6f7f96](119 AU，2018-11-05 穿越)[/color]" % (
-		"[color=#7f9fd0]已进入星际空间[/color]" if bool(orb["beyond_heliopause"]) else "仍在日球层内"))
+		vals["v_inf"] = "仍在束缚轨道上"
+		vals["escape"] = "尚未逃逸 BOUND"
+	vals["heliopause"] = ("已进入星际空间" if bool(orb["beyond_heliopause"])
+		else "仍在日球层内")
+	vals["sep_note"] = ("↳ 天线往哪儿指 · SEP < 5° 时链路被太阳噪声压制" if sep >= 5.0
+		else "↳ SEP %.2f° —— 接近太阳合，链路正被太阳噪声压制" % sep)
+
 	var near := Geometry.nearest_body(probe["pos"], eph.bodies,
 		func(n: String, j: float) -> Dictionary: return eph.state_at(n, j), jd_now)
 	if String(near["name"]) != "":
-		o.append("[color=#8fa3bf]最近天体[/color]  %s   %s km  (%.4f AU)" % [
-			String(near["label"]), JDTime.sci(float(near["distance_km"])),
-			float(near["distance_km"]) / eph.au_km])
-	lbl_orbit.text = "\n".join(o)
+		vals["near_name"] = String(near["label"])
+		vals["near_dist"] = "· %s km（%.4f AU）" % [
+			JDTime.sci(float(near["distance_km"])),
+			float(near["distance_km"]) / eph.au_km]
+	else:
+		vals["near_name"] = "—"
+		vals["near_dist"] = ""
+
+	hud.set_values(vals)
+	hud.set_escaping(bool(orb["escaping"]))
+	hud.set_bars(float(pw["fuel_fraction"]), float(pw["converter_fraction"]))
+	hud.set_stations(Geometry.visible_stations(float(trk["dec_deg"])))
+	if not _syncing_slider:
+		slider.value = jd_now
+
+	# ---- 数据来源与相机锁定的附注 ----
+	var notes := PackedStringArray()
+	if not in_range:
+		notes.append("⚠ 该时刻超出星历覆盖范围")
+	if eph.satellites.has(focus_target):
+		var src_ok: bool = bool(_orbit_from_ephemeris.get(focus_target, false))
+		notes.append("锁定 %s：轨道环数据源 %s" % [_focus_label(),
+			"归档星历（精确，含轨道面进动）" if src_ok
+			else "开普勒要素示意（相位不可信）"])
+	if focus_note != "":
+		notes.append(focus_note)
+	hud.set_focus_note("\n".join(notes))
+
+	# ---- 屏幕空间标注（探测器准星 / 地球 / 下行链路线）----
+	# 只更新文字，屏幕坐标由 _project_annotations() 在相机变动时算 ——
+	# 相机可以在不刷新星历的情况下单独拖动，投影不能只在这儿算一次。
+	_probe_in_range = in_range
+	var an := hud.annotations
+	an.probe_line2 = "%.2f AU · %.3f km/s" % [helio_au, speed]
+	an.probe_line3 = "NAIF -32 · %s" % (
+		"星际空间" if bool(orb["beyond_heliopause"]) else "日球层内")
+	var op2 := _time_pair(owlt)
+	an.link_label = "DOWNLINK · %s %s 光时" % [op2[0], _unit_abbr(String(op2[1]))]
 
 	# ---- 曲线标记 ----
 	var ratio := (jd_now - jd_min) / maxf(1e-9, jd_max - jd_min)
 	spark_power.marker_ratio = clampf(ratio, 0.0, 1.0)
-	spark_power.value_text = "%.1f W" % float(pw["watts"])
 	spark_power.queue_redraw()
 	spark_dist.marker_ratio = clampf(ratio, 0.0, 1.0)
-	spark_dist.value_text = "%.2f AU" % float(trk["range_au"])
 	spark_dist.queue_redraw()
 	spark_rx.marker_ratio = clampf(ratio, 0.0, 1.0)
-	spark_rx.value_text = "%.1f dBm" % float(link["rx_dbm"])
 	spark_rx.queue_redraw()
 
 	if selected_component == "":
-		var hint := "按 Tab 切到探测器特写，再[b]右键[/b]点选部件。"
-		if mode == ViewMode.CRAFT:
-			hint = "[b]右键[/b]点选部件查看归属与置信度。试试舱体侧面那张金唱片。"
-		lbl_component.text = "[color=#8fa3bf]%s[/color]" % hint
+		hud.set_component("—", "右键点选部件，查看 ComponentID、归属判据与置信度。"
+			+ "试试舱体侧面那张金唱片。", "", "未选中")
 
+
+## "-60.108°" -> "−60.108°"。稿子里的负号是排版负号 U+2212，不是 ASCII 连字符。
+func _typo_minus(t: String) -> String:
+	return t.replace("-", "−")
+
+
+## 屏幕标注里用缩写单位（稿子写的是 "20.01 h 光时"）。
+func _unit_abbr(u: String) -> String:
+	match u:
+		"秒": return "s"
+		"分钟": return "min"
+		"小时": return "h"
+		"天": return "d"
+	return u
+
+
+## 时长拆成 [数值, 单位]，喂给四格里的大数字 + 小单位。
+func _time_pair(sec: float) -> Array:
+	if sec <= 0.0:
+		return ["—", ""]
+	if sec < 120.0:
+		return ["%.1f" % sec, "秒"]
+	if sec < 7200.0:
+		return ["%.1f" % (sec / 60.0), "分钟"]
+	if sec < 86400.0:
+		return ["%.2f" % (sec / 3600.0), "小时"]
+	return ["%.2f" % (sec / 86400.0), "天"]
 
 ## 行星和探测器按真实比例在这个尺度下只有零点几个单位，拉远之后就是几个
 ## 亚像素的点，等于看不见。所以标记随相机距离等比放大 —— 这是示意尺寸，
@@ -1386,6 +1418,31 @@ func _update_camera() -> void:
 	# 内容。行星系统视图里看不到整条航迹，这是可接受的取舍。
 	camera.near = clampf(cam_dist * 0.01, 1.0e-5, 20.0)
 	camera.far = camera.near * 8.0e4
+	_project_annotations()
+
+
+## 把探测器和地球的 3D 位置投影到屏幕，喂给 HUD 的准星标注。
+## 相机一动就要重算，所以挂在 _update_camera() 尾巴上。
+func _project_annotations() -> void:
+	if hud == null or hud.annotations == null or camera == null:
+		return
+	var an := hud.annotations
+	if mode != ViewMode.SYSTEM or probe_root == null:
+		an.probe_on = false
+		an.earth_on = false
+		return
+	var pp := probe_root.global_position
+	an.probe_on = _probe_in_range and not camera.is_position_behind(pp)
+	if an.probe_on:
+		an.probe_pos = camera.unproject_position(pp)
+	if planet_nodes.has("earth"):
+		var earth_node: Node3D = planet_nodes["earth"]
+		var ep := earth_node.global_position
+		an.earth_on = earth_node.visible and not camera.is_position_behind(ep)
+		if an.earth_on:
+			an.earth_pos = camera.unproject_position(ep)
+	else:
+		an.earth_on = false
 
 
 ## 当前锁定目标的人类可读名字，外加它是否真的被对准。
@@ -1450,7 +1507,7 @@ func _set_focus(target: String) -> void:
 			var date := String(ENCOUNTER_DATE.get(parent, ""))
 			if date != "":
 				var jd := _event_jd(date)
-				if jd != jd_max:
+				if jd != jd_now:
 					_seek(jd)
 					focus_note = "已跳到 %s 飞掠 —— 只有这个窗口有 30 分钟采样，别处日采样定不出它的位置" % date
 			if focus_note == "":
@@ -1489,7 +1546,15 @@ func _set_focus(target: String) -> void:
 func _unhandled_input(event: InputEvent) -> void:
 	if fatal_error != "":
 		return
-	if event is InputEventMouseMotion and (event as InputEventMouseMotion).button_mask & MOUSE_BUTTON_MASK_LEFT:
+	if event is InputEventScreenTouch:
+		_handle_screen_touch(event as InputEventScreenTouch)
+	elif event is InputEventScreenDrag:
+		_handle_screen_drag(event as InputEventScreenDrag)
+	elif event is InputEventMouseMotion and (event as InputEventMouseMotion).button_mask & MOUSE_BUTTON_MASK_LEFT:
+		# 第二根手指抬起后，模拟鼠标的相对位移基准可能已经换到另一根手指；
+		# 等整次多指手势结束再恢复旋转，才能避免相机突然甩动。
+		if _multitouch_active:
+			return
 		var mm := event as InputEventMouseMotion
 		_drag_travel += mm.relative.length()
 		cam_yaw -= mm.relative.x * 0.006
@@ -1508,8 +1573,8 @@ func _unhandled_input(event: InputEvent) -> void:
 		elif mb.button_index == MOUSE_BUTTON_LEFT:
 			# 左键按下开始计拖动距离；松手时几乎没动，就当作点选。
 			if mb.pressed:
-				_drag_travel = 0.0
-			elif _drag_travel < 6.0 and mode == ViewMode.CRAFT:
+				_drag_travel = 1000000.0 if _multitouch_active else 0.0
+			elif not _long_press_consumed and _drag_travel < 6.0 and mode == ViewMode.CRAFT:
 				_pick_component(mb.position)
 	elif event is InputEventKey and (event as InputEventKey).pressed:
 		var k := event as InputEventKey
@@ -1521,6 +1586,86 @@ func _unhandled_input(event: InputEvent) -> void:
 			_set_focus("")
 		elif k.keycode == KEY_TAB:
 			_on_mode_pressed()
+
+
+func _handle_screen_touch(touch: InputEventScreenTouch) -> void:
+	if touch.pressed:
+		_touch_positions[touch.index] = touch.position
+		if _touch_positions.size() == 1 and not _multitouch_active:
+			_long_press_index = touch.index
+			_long_press_start = touch.position
+			_long_press_position = touch.position
+			_long_press_elapsed = 0.0
+			_long_press_consumed = false
+		elif _touch_positions.size() >= 2:
+			_multitouch_active = true
+			_pinch_distance = _pinch_pair_distance()
+			_cancel_long_press()
+			_drag_travel = 1000000.0
+		return
+
+	_touch_positions.erase(touch.index)
+	if touch.index == _long_press_index:
+		if _long_press_consumed:
+			_drag_travel = 1000000.0
+		_cancel_long_press()
+		_long_press_consumed = false
+	if _multitouch_active:
+		# 捏合中换了一对手指时距离基准也必须重置，否则会把换指误当成缩放。
+		_pinch_distance = _pinch_pair_distance() if _touch_positions.size() >= 2 else 0.0
+		if _touch_positions.is_empty():
+			_multitouch_active = false
+			_drag_travel = 1000000.0
+
+
+func _handle_screen_drag(drag: InputEventScreenDrag) -> void:
+	_touch_positions[drag.index] = drag.position
+	if _multitouch_active:
+		if _touch_positions.size() < 2:
+			return
+		var distance := _pinch_pair_distance()
+		if _pinch_distance > 0.0 and distance > 0.0:
+			cam_dist = minf(maxf(cam_dist * _pinch_distance / distance, 0.004), 40000.0)
+			_update_camera()
+		_pinch_distance = distance
+		return
+	if drag.index == _long_press_index:
+		_long_press_position = drag.position
+		if _long_press_start.distance_to(drag.position) > 12.0:
+			_cancel_long_press()
+
+
+func _pinch_pair_distance() -> float:
+	if _touch_positions.size() < 2:
+		return 0.0
+	var indices: Array[int] = []
+	for index: int in _touch_positions:
+		indices.append(index)
+	indices.sort()
+	return _touch_positions[indices[0]].distance_to(_touch_positions[indices[1]])
+
+
+func _update_long_press(delta: float) -> void:
+	if _long_press_index < 0 or _long_press_consumed or _multitouch_active:
+		return
+	if not _touch_positions.has(_long_press_index):
+		_cancel_long_press()
+		return
+	_long_press_elapsed += delta
+	if _long_press_elapsed < 0.45:
+		return
+	if mode == ViewMode.CRAFT:
+		_pick_component(_long_press_position)
+		_long_press_consumed = true
+		_drag_travel = 1000000.0
+	else:
+		_cancel_long_press()
+
+
+func _cancel_long_press() -> void:
+	_long_press_index = -1
+	_long_press_elapsed = 0.0
+
 
 
 ## 部件点选：对三角网格做物理射线求交，精确到面。
@@ -1545,6 +1690,38 @@ func _pick_component(screen_pos: Vector2) -> void:
 	_select_component(owner_node.name)
 
 
+## 把某个部件的契约信息推给 HUD。只管文字，不碰 3D 材质和相机 ——
+## 换界面倍率重建 HUD 之后要能单独把这块内容填回去。
+func _push_component_contract(node_name: String) -> void:
+	# 找出所有指向该节点的 ComponentID（含模型未区分的别名）。
+	var ids := []
+	var note := ""
+	for c in eph.components:
+		if String(c["node"]) == node_name:
+			ids.append(c)
+			note = String(c["confidence_note"])
+
+	var id_text := node_name
+	var attribution := "该节点不在组件契约中。"
+	var alias := ""
+	if not ids.is_empty():
+		var distinct := []
+		var aliased := []
+		for c in ids:
+			if bool(c["distinct_geometry"]):
+				distinct.append(String(c["id"]))
+			else:
+				aliased.append(String(c["id"]))
+		if not distinct.is_empty():
+			id_text = ", ".join(distinct)
+		attribution = note
+		if not aliased.is_empty():
+			alias = "⚠ 该视觉模型未区分以下仪器，它们共用这块几何：%s" % ", ".join(aliased)
+	var badge := "12 英寸镀金铜盘" if node_name == "GoldenRecord" else node_name
+	hud.set_component(id_text, attribution, alias, badge)
+	hud.set_values({"sel_name": node_name})
+
+
 func _select_component(node_name: String) -> void:
 	# 还原上一次高亮。
 	if selected_component != "" and component_nodes.has(selected_component):
@@ -1557,40 +1734,10 @@ func _select_component(node_name: String) -> void:
 	if node_name != "GoldenRecord":
 		mi.mesh.surface_set_material(0, highlight_material)
 
-	# 找出所有指向该节点的 ComponentID（含模型未区分的别名）。
-	var ids := []
-	var note := ""
-	for c in eph.components:
-		if String(c["node"]) == node_name:
-			ids.append(c)
-			note = String(c["confidence_note"])
-
-	var lines := PackedStringArray()
-	lines.append("[b]%s[/b]" % node_name)
-	if ids.is_empty():
-		lines.append("[color=#b06060]该节点不在组件契约中[/color]")
-	else:
-		var distinct := []
-		var aliased := []
-		for c in ids:
-			if bool(c["distinct_geometry"]):
-				distinct.append(String(c["id"]))
-			else:
-				aliased.append(String(c["id"]))
-		if not distinct.is_empty():
-			lines.append("ComponentID：%s" % ", ".join(distinct))
-		if not aliased.is_empty():
-			lines.append("[color=#d98a3a]该视觉模型未区分以下仪器，它们共用这块几何：[/color]")
-			lines.append("  %s" % ", ".join(aliased))
-		lines.append("")
-		lines.append("[color=#8fa3bf]归属判据[/color]  %s" % note)
-	lines.append("")
-	lines.append("[color=#6f7f96]NASA 不提供 Voyager 2 的公开工程遥测，[/color]")
-	lines.append("[color=#6f7f96]所以此处没有该部件的温度/电压读数 —— 没有就是没有。[/color]")
-	lbl_component.text = "\n".join(lines)
+	_push_component_contract(node_name)
 
 	if node_name == "GoldenRecord":
-		_show_record_panel()
+		hud.set_record_visible(true)
 		# 把镜头推到唱片上，让人直接看 NASA 模型自带的真实封面蚀刻图案。
 		craft_focus = mi.global_transform * record_center
 		# 唱片直径 0.314 m，要填满画面，相机距离取直径的 1.4 倍左右。
@@ -1600,41 +1747,12 @@ func _select_component(node_name: String) -> void:
 		record_spinning = true
 		_update_camera()
 	else:
-		record_panel.visible = false
+		hud.set_record_visible(false)
 		craft_focus = Vector3.ZERO
 		record_spinning = false
 		if record_node != null:
 			record_node.transform = record_orig_xform
 			record_angle = 0.0
-
-
-func _show_record_panel() -> void:
-	record_panel.visible = true
-	var spec := GoldenRecord.SPEC
-	var r := PackedStringArray()
-	r.append("[b]旅行者金唱片[/b]  [color=#c9a227]12 英寸镀金铜盘[/color]")
-	r.append("[color=#6f7f96]你现在看到的封面蚀刻图案是 NASA 模型自带的真实贴图：[/color]")
-	r.append("[color=#6f7f96]左上播放示意 · 右上二进制时基 · 中间图像光栅 · 左下 14 颗脉冲星定位图 · 右下氢原子跃迁[/color]")
-	r.append("")
-	r.append("转速 %s" % String(spec["rpm"]))
-	r.append("%s" % String(spec["clock"]))
-	r.append("载荷：%d 张图像 · %d 种语言问候 · %d 首乐曲（约 %d 分钟）· %d 分钟地球之声" % [
-		int(spec["images"]), int(spec["languages"]), int(spec["music_tracks"]),
-		int(spec["music_minutes"]), int(spec["sounds_minutes"])])
-	r.append("")
-	for sec in GoldenRecord.CONTENTS:
-		r.append("[b]%s[/b]" % String(sec["section"]))
-		if String(sec["note"]) != "":
-			r.append("  [color=#6f7f96]%s[/color]" % String(sec["note"]))
-		for it in sec["items"]:
-			r.append("  · %s" % String(it))
-		r.append("")
-	r.append("[color=#d98a3a]为什么这里没有唱片上的音乐：[/color]")
-	r.append("[color=#6f7f96]那 27 首绝大多数是受版权保护的商业录音，NASA 当年只取得一次性搭载[/color]")
-	r.append("[color=#6f7f96]授权，并未置于公有领域 —— NASA 自己的图库都因版权只展示 116 张图的一部分。[/color]")
-	r.append("[color=#6f7f96]所以这里不打包任何录音，只合成唱片上真实存在的物理信号：[/color]")
-	r.append("[color=#6f7f96]1000 Hz 参考校准音，以及图像的模拟扫描线编码。[/color]")
-	lbl_record.text = "\n".join(r)
 
 
 func _ensure_audio() -> AudioStreamGeneratorPlayback:
@@ -1698,24 +1816,88 @@ func _pump_audio() -> void:
 		audio_queue = PackedVector2Array()
 
 
+## ---- 界面倍率 ----
+##
+## 走的是"按新字号重新栅格化字体 + 按新倍率重排布局"，不是给画布加 transform：
+## Godot 的字体是按字号栅格化进位图图集的，缩放画布只会把字形贴图放大糊掉。
+## 代价是换档必须重建整层 HUD，所以做成离散档位。
+func _set_ui_scale(v: float) -> void:
+	if is_equal_approx(v, ui_scale):
+		return
+	ui_scale = clampf(v, 0.5, 3.0)
+	_save_settings()
+	_rebuild_hud()
+
+
+func _rebuild_hud() -> void:
+	# 旧层立刻脱树再释放：queue_free 是延迟的，不 remove_child 会有一帧两层
+	# HUD 叠在一起。
+	var old_layer := hud.get_parent()
+	remove_child(old_layer)
+	old_layer.queue_free()
+
+	HudTheme.set_scale(ui_scale)
+	_build_ui()
+	_build_series()
+	_set_mode(mode)
+	hud.set_playing(playing)
+	if dsn_text != "":
+		hud.set_dsn(dsn_text)
+	# 相机锁定下拉与部件契约都要回到重建前的状态
+	if btn_focus != null:
+		for i in btn_focus.item_count:
+			if String(btn_focus.get_item_metadata(i)) == focus_target:
+				btn_focus.selected = i
+	if selected_component != "":
+		_push_component_contract(selected_component)
+		hud.set_record_visible(selected_component == "GoldenRecord")
+	_refresh()
+
+
+func _load_settings() -> void:
+	var cfg := ConfigFile.new()
+	if cfg.load(SETTINGS_PATH) != OK:
+		return
+	var v := float(cfg.get_value("display", "ui_scale", 1.0))
+	# 只认已知档位，配置文件被手改成 3.7 之类也不至于把界面搞崩
+	for step in UI_SCALES:
+		if is_equal_approx(float(step), v):
+			ui_scale = float(step)
+	HudTheme.set_scale(ui_scale)
+
+
+func _save_settings() -> void:
+	var cfg := ConfigFile.new()
+	cfg.load(SETTINGS_PATH)      # 存在就沿用，别把别的段落冲掉
+	cfg.set_value("display", "ui_scale", ui_scale)
+	cfg.save(SETTINGS_PATH)
+
+
+## DSN 状态栏的文案。带 bbcode 给 HUD，纯文本留给自检。
+func _set_dsn(bb: String) -> void:
+	var re := RegEx.create_from_string("\\[/?[^\\]]+\\]")
+	dsn_text = re.sub(bb, "", true)
+	hud.set_dsn(bb)
+
+
 func _on_dsn_pressed() -> void:
 	if dsn_request == null:
 		dsn_request = HTTPRequest.new()
 		add_child(dsn_request)
 		dsn_request.request_completed.connect(_on_dsn_done)
-	lbl_dsn.text = "DSN 链路：查询中…"
+	_set_dsn("[color=#5c7d76]查询中…[/color]")
 	var url := "https://eyes.nasa.gov/dsn/data/dsn.xml?r=%d" % Time.get_unix_time_from_system()
 	if dsn_request.request(url) != OK:
-		lbl_dsn.text = "DSN 链路：请求发起失败"
+		_set_dsn("[color=#ff9a9a]请求发起失败[/color]")
 
 
 func _on_dsn_done(_result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
 	if code != 200:
-		lbl_dsn.text = "DSN 链路：HTTP %d" % code
+		_set_dsn("[color=#ff9a9a]HTTP %d[/color]" % code)
 		return
 	var parser := XMLParser.new()
 	if parser.open_buffer(body) != OK:
-		lbl_dsn.text = "DSN 链路：XML 解析失败"
+		_set_dsn("[color=#ff9a9a]XML 解析失败[/color]")
 		return
 	var connected := false
 	var rate := 0.0
@@ -1744,13 +1926,15 @@ func _on_dsn_done(_result: int, code: int, _headers: PackedStringArray, body: Pa
 				rate = float(_attr(parser, "dataRate"))
 				dish = last_dish
 	if connected:
-		lbl_dsn.text = "DSN 链路：正在跟踪  %s   下行 %.0f bps  〔实时〕" % [dish, rate]
+		_set_dsn("正在跟踪 [color=#7dffd4]%s[/color] · 下行 [color=#7dffd4]%.0f bps[/color]"
+			% [dish, rate])
 	elif dsn_active_craft.is_empty():
 		# 一个航天器都没解析出来，说明是解析或馈送出了问题，不是「没在跟踪」。
-		lbl_dsn.text = "DSN 链路：馈送已收到但未解析出任何航天器 —— 疑似解析故障"
+		_set_dsn("[color=#ffcf8f]馈送已收到但未解析出任何航天器 —— 疑似解析故障[/color]")
 	else:
 		# 这是常态：Voyager 2 赤纬极低，基本只有堪培拉 DSS-43 能看见，一天连几小时。
-		lbl_dsn.text = "DSN 链路：当前未跟踪（常态，非故障）｜此刻全网在跟 %s 〔实时〕" % ", ".join(dsn_active_craft)
+		_set_dsn("当前未跟踪（常态，非故障）· 全网在跟 [color=#7dffd4]%s[/color]"
+			% ", ".join(dsn_active_craft))
 
 
 func _attr(parser: XMLParser, key: String) -> String:
@@ -1768,14 +1952,14 @@ func _run_screenshot_harness() -> void:
 	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(out_dir))
 
 	var steps: Array = [
-		{"name": "01_now_system", "jd": jd_max, "mode": ViewMode.SYSTEM, "dist": 3200.0},
+		{"name": "01_now_system", "jd": _jd_today(), "mode": ViewMode.SYSTEM, "dist": 3200.0},
 		{"name": "02_neptune_flyby", "jd": _event_jd("1989-08-25"), "mode": ViewMode.SYSTEM, "dist": 520.0},
 		{"name": "03_jupiter_flyby", "jd": _event_jd("1979-07-09"), "mode": ViewMode.SYSTEM, "dist": 160.0},
 		{"name": "04_launch", "jd": jd_min + 1.0, "mode": ViewMode.SYSTEM, "dist": 60.0},
-		{"name": "05_craft", "jd": jd_max, "mode": ViewMode.CRAFT, "dist": 30.0},
-		{"name": "06_craft_rtg", "jd": jd_max, "mode": ViewMode.CRAFT, "dist": 13.0,
+		{"name": "05_craft", "jd": _jd_today(), "mode": ViewMode.CRAFT, "dist": 30.0},
+		{"name": "06_craft_rtg", "jd": _jd_today(), "mode": ViewMode.CRAFT, "dist": 13.0,
 			"select": "RTG_2", "yaw": 1.9, "pitch": 0.15},
-		{"name": "07_golden_record", "jd": jd_max, "mode": ViewMode.CRAFT, "dist": 1.1,
+		{"name": "07_golden_record", "jd": _jd_today(), "mode": ViewMode.CRAFT, "dist": 1.1,
 			"select": "GoldenRecord"},
 		{"name": "08_sun", "jd": _event_jd("1979-07-09"), "mode": ViewMode.SYSTEM,
 			"dist": 16.0, "focus_sun": true, "deselect": true},
@@ -1814,7 +1998,7 @@ func _run_screenshot_harness() -> void:
 			focus_target = ""
 		if st.has("deselect"):
 			selected_component = ""
-			record_panel.visible = false
+			hud.set_record_visible(false)
 			record_spinning = false
 		if st.has("yaw"):
 			cam_yaw = float(st["yaw"])
@@ -1835,11 +2019,176 @@ func _run_screenshot_harness() -> void:
 	get_tree().quit()
 
 
+## HUD 接线自检：数值 key、时间轴、播放、视图切换、金唱片面板。
+##
+## 存在的理由：HUD 是"喂 key 改文字"的结构，key 打错或撞名不会报错，
+## 只会让某个数字永远停在占位符上 —— 肉眼很难发现。
+func _run_hud_selftest() -> void:
+	await get_tree().process_frame
+	var fails := 0
+	# 自检必须在已知倍率下跑：界面倍率是持久化的，上次退出时留在 150% 的话，
+	# 下面所有宽度断言都会按 1.5 倍去量，结果看起来像 bug（踩过一次）。
+	var entry_scale := ui_scale
+	if not is_equal_approx(ui_scale, 1.0):
+		_set_ui_scale(1.0)
+		await get_tree().process_frame
+	print("HUDTEST 起始倍率 %.2f -> 自检固定在 1.00" % entry_scale)
+
+	# 1. 数值 key 必须一一对得上
+	_refresh()
+	if not hud.unknown_keys.is_empty():
+		fails += 1
+		print("HUDTEST FAIL 喂了 HUD 不认识的 key: %s" % ", ".join(hud.unknown_keys))
+	if not hud.duplicate_keys.is_empty():
+		fails += 1
+		print("HUDTEST FAIL key 撞名（后者顶掉前者）: %s" % ", ".join(hud.duplicate_keys))
+	print("HUDTEST key 对齐  未知 %d  撞名 %d  %s" % [
+		hud.unknown_keys.size(), hud.duplicate_keys.size(),
+		"OK" if hud.unknown_keys.is_empty() and hud.duplicate_keys.is_empty() else "FAIL"])
+
+	# 2. 时间轴拖动要真的改时间
+	var before := jd_now
+	hud.timeline._seek_to(hud.timeline.size.x * 0.25)
+	var moved := absf(jd_now - before) > 1.0
+	if not moved:
+		fails += 1
+	print("HUDTEST 时间轴拖动 %s -> %s  %s" % [
+		JDTime.format_date_short(before), JDTime.format_date_short(jd_now),
+		"OK" if moved else "FAIL 时间没动"])
+	_seek(before)
+
+	# 3. 播放按钮
+	_on_play_pressed()
+	var play_ok := playing and hud.play_label() == "暂停"
+	_on_play_pressed()
+	play_ok = play_ok and not playing and hud.play_label() == "播放"
+	if not play_ok:
+		fails += 1
+	print("HUDTEST 播放按钮 %s" % ("OK" if play_ok else "FAIL 文案或状态不同步"))
+
+	# 4. 视图切换：两栏 HUD 与时间轴的显隐
+	_set_mode(ViewMode.CRAFT)
+	var craft_ok := hud.panel_visible("left_craft") \
+		and not hud.panel_visible("left_system") \
+		and not hud.panel_visible("right_system") \
+		and not hud.panel_visible("timeline")
+	_set_mode(ViewMode.SYSTEM)
+	var sys_ok := hud.panel_visible("left_system") \
+		and hud.panel_visible("right_system") \
+		and hud.panel_visible("timeline") \
+		and not hud.panel_visible("left_craft")
+	if not (craft_ok and sys_ok):
+		fails += 1
+	print("HUDTEST 视图切换 CRAFT=%s SYSTEM=%s  %s" % [
+		craft_ok, sys_ok, "OK" if craft_ok and sys_ok else "FAIL 面板显隐不对"])
+
+	# 5. 金唱片面板只在选中金唱片时出现
+	_set_mode(ViewMode.CRAFT)
+	var rec_ok := not hud.panel_visible("right_craft")
+	if component_nodes.has("GoldenRecord"):
+		_select_component("GoldenRecord")
+		rec_ok = rec_ok and hud.panel_visible("right_craft")
+		if component_nodes.has("RTG_2"):
+			_select_component("RTG_2")
+			rec_ok = rec_ok and not hud.panel_visible("right_craft")
+	else:
+		rec_ok = false
+	if not rec_ok:
+		fails += 1
+	print("HUDTEST 金唱片面板 %s" % ("OK" if rec_ok else "FAIL 显隐跟选中不同步"))
+
+	# 6. 窄窗口降级：底栏必须自己收得住，且控件永不消失
+	_set_mode(ViewMode.SYSTEM)
+	for w in [1600.0, 1400.0, 1280.0, 1100.0, 960.0, 820.0]:
+		hud.size = Vector2(float(w), 900.0)
+		hud.relayout()
+		var avail := float(w) - 80.0
+		var need := hud.bar_row_min_width()
+		# 要么装得下，要么该收的都收完了（极窄时允许溢出，但不能是没降级）
+		var fits := need <= avail + 1.0
+		var bottomed := not hud.bar_item_visible("legend") \
+			and not hud.bar_item_visible("legend_compact") \
+			and not hud.bar_item_visible("lock_cap")
+		var controls_ok := hud.btn_focus.visible
+		# 设计稿基准宽度下，数据来源图例至少要留着紧凑版 —— "每个数字都带来源
+		# 标注"是第一纪律，宁可牺牲字数。字重上浮后长版在 1600 宽已装不下，
+		# 所以这里要的是"没被整块收掉"，不是"必须显示长版"。
+		var no_over_degrade := float(w) < 1400.0 \
+			or hud.bar_item_visible("legend") or hud.bar_item_visible("legend_compact")
+		var ok := (fits or bottomed) and controls_ok and no_over_degrade
+		if not ok:
+			fails += 1
+		print("HUDTEST 窄窗口 %4d 宽  需要 %4d / 可用 %4d  [%s]  %s" % [
+			int(float(w)), int(need), int(avail), hud.bar_row_breakdown(),
+			"OK" if ok else "FAIL"])
+	hud.size = get_viewport().get_visible_rect().size
+	hud.relayout()
+
+	# 7. 界面倍率：重建后字号与布局按倍率放大，且状态不丢
+	_seek(_jd_today())
+	var jd_before := jd_now
+	_set_mode(ViewMode.CRAFT)
+	if component_nodes.has("GoldenRecord"):
+		_select_component("GoldenRecord")
+	for target in [1.5, 1.0]:
+		_set_ui_scale(float(target))
+		await get_tree().process_frame
+		await get_tree().process_frame
+		var f := float(target)
+		var want_col := HudTheme.dp(428)
+		var got_col := hud.column_size("left_craft").x
+		var math_ok := is_equal_approx(HudTheme.scale, f) \
+			and HudTheme.fs(11) == int(round(11.0 * f)) \
+			and is_equal_approx(HudTheme.dp(428), round(428.0 * f))
+		# 布局真的按倍率变了（左栏在 CRAFT 下宽 400，不是 428）
+		var layout_ok := absf(got_col - HudTheme.dp(400)) < 2.0
+		# 重建不能丢状态
+		var state_ok := mode == ViewMode.CRAFT \
+			and selected_component == "GoldenRecord" \
+			and hud.panel_visible("right_craft") \
+			and absf(slider.value - jd_before) < 1e-6
+		var ok := math_ok and layout_ok and state_ok
+		if not ok:
+			fails += 1
+		# 窗口装不下就必须给出提示（1600×900 下 150% 会溢出）
+		var vs := get_viewport().get_visible_rect().size
+		var should_warn := vs.x < HudTheme.dp(1600) - 1.0 or vs.y < HudTheme.dp(900) - 1.0
+		var warn_ok := hud.bar_item_visible("too_small") == should_warn
+		if not warn_ok:
+			fails += 1
+			print("HUDTEST FAIL 倍率 %d%% 装不下=%s 但提示=%s" % [
+				int(f * 100.0), should_warn, hud.bar_item_visible("too_small")])
+		print("HUDTEST 界面倍率 %3d%%  字号 11->%d  布局 400->%d(实测 %d)  状态保持=%s  %s" % [
+			int(f * 100.0), HudTheme.fs(11), int(HudTheme.dp(400)), int(got_col),
+			state_ok, "OK" if ok and warn_ok else "FAIL"])
+	_set_ui_scale(entry_scale)
+	_set_mode(ViewMode.SYSTEM)
+
+	print("HUDTEST_DONE 失败 %d" % fails)
+	get_tree().quit()
+
+
+## FATAL 屏单独截图。
+func _run_fatal_shot() -> void:
+	await RenderingServer.frame_post_draw
+	await RenderingServer.frame_post_draw
+	var out := ProjectSettings.globalize_path("res://../assets/generated/godot_shots")
+	DirAccess.make_dir_recursive_absolute(out)
+	var err := get_viewport().get_texture().get_image().save_png(out + "/00_fatal.png")
+	print("SHOT 00_fatal -> %s (%s)" % [out, "ok" if err == OK else "err %d" % err])
+	get_tree().quit()
+
+
+## 真实"现在"在时间轴上的位置。星历覆盖到 2060，jd_max 不再等于现在。
+func _jd_today() -> float:
+	return clampf(JDTime.now_jd(), jd_min, jd_max)
+
+
 func _event_jd(date: String) -> float:
 	for ev in eph.events:
 		if String(ev["date"]) == date:
 			return float(ev["jd"])
-	return jd_max
+	return _jd_today()
 
 
 ## DSN 实时链路自检：真发一次请求，把结果打出来再退出。
@@ -1848,10 +2197,10 @@ func _event_jd(date: String) -> float:
 func _run_dsn_selftest() -> void:
 	_on_dsn_pressed()
 	var waited := 0.0
-	while lbl_dsn.text.ends_with("查询中…") and waited < 30.0:
+	while dsn_text.ends_with("查询中…") and waited < 30.0:
 		await get_tree().create_timer(0.25).timeout
 		waited += 0.25
-	print("DSNTEST %s" % lbl_dsn.text)
+	print("DSNTEST %s" % dsn_text)
 	# 顺带用一个确定在被跟踪的航天器做阳性对照，证明解析器不是永远返回未跟踪。
 	print("DSNTEST_DONE")
 	get_tree().quit()
@@ -1958,6 +2307,97 @@ func _run_attitude_selftest() -> void:
 ## 但轨道就错了。所以 cmd/export 会把 Go 侧在若干固定历元的解算结果写进
 ## metadata.json，这里逐点比对。
 ##   Godot --headless --path . -- --orbittest
+## 天穹对齐自检。
+##
+## 银河贴图的坐标系是实测定出来的（见 shaders/sky.gdshader 的推导），
+## 而世界坐标到银道要过三次旋转。这两段里任何一处符号写反，画面上都只是
+## "银河歪了一点"，肉眼几乎判不出来 —— 所以必须拿已知天体的银道坐标校验。
+##
+## 基准值全部是查得到的常量，不是从本实现反推的：
+##   银心            l=0     b=0        -> 贴图正中 (0.5, 0.5)
+##   黄北极          l=96.38 b=+29.81   -> 世界 +Y 必须落在这里
+##   大/小麦哲伦云   贴图上肉眼可见的亮团，实测落点已在着色器注释里
+##   Vector3 只有 float32，所以容差给到 1e-3（贴图 8192 宽，约 8 像素）。
+##   Godot --headless --path . -- --skytest
+func _run_sky_selftest() -> void:
+	var fails := 0
+	var rows := _galactic_rows()
+
+	# 1. 必须是纯旋转：行向量正交、模长为 1、行列式 +1（含镜像会让银河左右翻转）
+	for i in 3:
+		var ri: Vector3 = rows[i]
+		var n: float = ri.length()
+		if absf(n - 1.0) > 1e-5:
+			fails += 1
+			print("SKYTEST FAIL 第 %d 行不是单位向量：|r| = %.8f" % [i, n])
+	for pair in [[0, 1], [0, 2], [1, 2]]:
+		var ra: Vector3 = rows[pair[0]]
+		var rb: Vector3 = rows[pair[1]]
+		var d: float = ra.dot(rb)
+		if absf(d) > 1e-5:
+			fails += 1
+			print("SKYTEST FAIL 第 %d、%d 行不正交：点积 = %.8f" % [pair[0], pair[1], d])
+	var d0: Vector3 = rows[0]
+	var d1: Vector3 = rows[1]
+	var d2: Vector3 = rows[2]
+	var det: float = d0.dot(d1.cross(d2))
+	if absf(det - 1.0) > 1e-5:
+		fails += 1
+		print("SKYTEST FAIL 行列式 = %.8f，不是 +1（含镜像，银河会左右翻转）" % det)
+
+	# 2. 已知方向必须落在已知 UV 上
+	# 黄北极的银道坐标 l=96.383° b=+29.811° 是标准值；世界 +Y 就是黄北极。
+	var cases := [
+		["黄北极", Vector3(0, 1, 0), 0.5 - 96.383 / 360.0, 0.5 + 29.811 / 180.0],
+	]
+	for c in cases:
+		var uv := _galactic_uv(c[1])
+		var du: float = absf(uv.x - float(c[2]))
+		du = minf(du, 1.0 - du)                       # 经度环绕
+		var dv: float = absf(uv.y - float(c[3]))
+		if du > 1e-3 or dv > 1e-3:
+			fails += 1
+			print("SKYTEST FAIL %s：得到 (%.5f, %.5f)，期望 (%.5f, %.5f)" % [
+				c[0], uv.x, uv.y, float(c[2]), float(c[3])])
+
+	# 3. 反向：银心 / 麦哲伦云的银道坐标必须回到贴图上的实测落点
+	var marks := [
+		["银心", 0.0, 0.0, 0.5, 0.5],
+		["大麦哲伦云", 280.47, -32.89, 0.7209, 0.3173],
+		["小麦哲伦云", 302.81, -44.33, 0.6589, 0.2537],
+	]
+	for m in marks:
+		var l := deg_to_rad(float(m[1]))
+		var b := deg_to_rad(float(m[2]))
+		# 银道向量 -> 世界向量（矩阵是正交的，转置即逆）
+		var g := Vector3(cos(b) * cos(l), cos(b) * sin(l), sin(b))
+		var r0: Vector3 = rows[0]
+		var r1: Vector3 = rows[1]
+		var r2: Vector3 = rows[2]
+		var w: Vector3 = r0 * g.x + r1 * g.y + r2 * g.z
+		var uv := _galactic_uv(w)
+		var du: float = absf(uv.x - float(m[3]))
+		du = minf(du, 1.0 - du)
+		var dv: float = absf(uv.y - float(m[4]))
+		if du > 1e-3 or dv > 1e-3:
+			fails += 1
+			print("SKYTEST FAIL %s：得到 (%.5f, %.5f)，期望 (%.5f, %.5f)" % [
+				m[0], uv.x, uv.y, float(m[3]), float(m[4])])
+		else:
+			print("SKYTEST  ok  %-12s uv=(%.4f, %.4f)" % [m[0], uv.x, uv.y])
+
+	# 4. 贴图与着色器都得真的在
+	if load(TEX_MILKY_WAY) == null:
+		fails += 1
+		print("SKYTEST FAIL 找不到 %s" % TEX_MILKY_WAY)
+	if load("res://shaders/sky.gdshader") == null:
+		fails += 1
+		print("SKYTEST FAIL 找不到 res://shaders/sky.gdshader")
+
+	print("SKYTEST_DONE 失配 %d" % fails)
+	get_tree().quit()
+
+
 func _run_orbit_selftest() -> void:
 	var checks: Array = eph.metadata.get("satellite_check", [])
 	if checks.is_empty():

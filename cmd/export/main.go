@@ -233,7 +233,7 @@ func run(dbPath, outDir, assignPath string, powerStepDays int) error {
 		Units:     "km, km/s, JDTDB",
 		AUkm:      domain.AU,
 		Bodies:    metas, Components: components,
-		PowerCurve:        powerCurve(powerStepDays),
+		PowerCurve:        powerCurve(powerStepDays, coverageEndJD(metas)),
 		Events:            events(),
 		Profiles:          bodies.Profiles,
 		Satellites:        satelliteElements(),
@@ -286,9 +286,14 @@ func componentMeta(path string) ([]ComponentMeta, error) {
 	return out, nil
 }
 
-func powerCurve(stepDays int) []PowerPoint {
+// powerCurve samples the RTG model from launch to endJD.
+//
+// The end must track the ephemeris coverage rather than a hardcoded year: the
+// front end clamps to the last point, so a curve that stops short makes the
+// wattage readout freeze while the trajectory keeps moving.
+func powerCurve(stepDays int, endJD float64) []PowerPoint {
 	var out []PowerPoint
-	end := time.Date(2035, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := domain.JDToTime(endJD)
 	for t := power.LaunchTime; t.Before(end); t = t.AddDate(0, 0, stepDays) {
 		out = append(out, PowerPoint{
 			JD: domain.TimeToJD(t), Watts: power.TotalWatts(t),
@@ -297,6 +302,17 @@ func powerCurve(stepDays int) []PowerPoint {
 		})
 	}
 	return out
+}
+
+// coverageEndJD is the latest sample across all packed bodies.
+func coverageEndJD(metas []BodyMeta) float64 {
+	end := 0.0
+	for _, m := range metas {
+		if m.JDMax > end {
+			end = m.JDMax
+		}
+	}
+	return end
 }
 
 func events() []Event {

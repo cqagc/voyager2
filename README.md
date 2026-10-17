@@ -41,10 +41,18 @@ go run ./cmd/export
 |---|---|
 | 左键拖动 | 旋转视角 |
 | 滚轮 | 缩放 |
-| `空格` / 播放按钮 | 沿时间轴播放 1977 → 2026 |
+| `空格` / 播放按钮 | 沿时间轴播放 1977 → 2060 |
 | `Tab` / 模式按钮 | 太阳系视图 ⇄ 探测器特写 |
 | 特写模式下**右键** | 点选部件，查看 ComponentID、归属判据与置信度 |
-| 日期按钮 | 跳到发射 / 四次飞掠 / 穿越日球层顶 |
+| 拖动底部时间轴 | 任意时刻定位；轴上已标出发射 / 四次飞掠 / 穿越日球层顶 |
+| 点顶栏 DSN 链路 | 拉一次实时馈送 |
+| 底栏「界面」下拉 | 界面倍率 100% / 150% |
+
+界面倍率是**按新字号重新栅格化字体 + 按新倍率重排布局**，不是拉伸画面，所以
+150% 下文字仍然原生锐利。代价是换档要重建整层 HUD（瞬间完成，状态不丢）。
+HUD 按 1600×900 排版，所以 150% 需要约 2400×1350 的窗口才装得下 —— 装不下时
+底栏会直接标出来。倍率存在 `user://settings.cfg`。细节见
+[docs/architecture.md](docs/architecture.md) 第 10 节。
 
 ### 自检（无人值守可用）
 
@@ -54,6 +62,16 @@ go run ./cmd/export
 
 # 真发一次 DSN 请求，含阳性对照
 /Applications/Godot.app/Contents/MacOS/Godot --headless --path godot -- --dsntest
+
+# 天穹对齐：银道 -> 黄道 -> 世界坐标那条链路（银心 / 麦哲伦云落点校验）
+/Applications/Godot.app/Contents/MacOS/Godot --headless --path godot -- --skytest
+
+# HUD 接线：数值 key 对齐、时间轴、播放、视图切换、金唱片面板、窄窗口降级、
+# 界面倍率（字号/布局换算 + 重建后状态保持 + 窗口装不下的提示）
+/Applications/Godot.app/Contents/MacOS/Godot --headless --path godot -- --hudtest
+
+# 数据包缺失时的 FATAL 屏（正常流程截不到，单独一张）
+/Applications/Godot.app/Contents/MacOS/Godot --path godot --resolution 1600x900 -- --fatalshot
 
 # 命令行工具
 go run ./cmd/dsnwatch -once            # Voyager 2 实时链路
@@ -73,6 +91,30 @@ float32 的量化误差约 1826 km 且与缩放无关，在全太阳系视图相
 33480 km，**超过海王星半径 24764 km** —— 探测器会渲染到星球错误的一侧。原因是引力
 弹弓处速度矢量是尖点，导数不连续，任何多项式插值都达不到全阶收敛。策略：巡航 1 天
 （误差 50 公分），飞掠窗口 30 分钟（误差 170 km）。已固化为回归测试。
+
+## 素材署名
+
+天体与银河贴图来自 **Solar System Scope**（https://www.solarsystemscope.com/textures/），
+基于 NASA 的地形与影像数据，按 **CC BY 4.0** 授权。分发本项目时必须保留署名：
+
+> Solar System textures by Solar System Scope (https://www.solarsystemscope.com/),
+> based on NASA elevation and imagery data. Licensed under CC BY 4.0.
+
+清单、用途、以及两条容易踩的约定（土星环只取颜色不取 alpha；那套图**没有**
+木卫一/二/三/四、土卫六、天卫五、海卫一，这七颗仍是程序化的）见
+`godot/assets/textures/CREDITS.md`。
+
+HUD 用 **JetBrains Mono** + **Noto Sans SC**，两者均为 **SIL OFL 1.1**，随仓库分发；
+署名与两个实现约定（等宽字挂中文回退、letter-spacing 走 `FontVariation.spacing_glyph`）
+见 `godot/assets/fonts/CREDITS.md`。
+
+## 许可证
+
+本项目代码以 **GNU AGPL-3.0** 授权（见 `LICENSE`）：修改后分发或以网络服务方式提供，
+都必须以同一协议公开完整源码。第三方素材不在 AGPL 范围内，各自沿用原协议——贴图 CC BY 4.0、
+字体 SIL OFL 1.1、NASA 探测器模型为 NASA 公开媒体，署名见上文「素材署名」。
+
+Copyright (C) 2026 重庆弘创达科技有限公司 (Chongqing Hongchuangda Technology Co., Ltd.)
 
 ## 尚未开始
 

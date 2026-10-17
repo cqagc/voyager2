@@ -21,6 +21,14 @@ uniform vec3 ring_color : source_color = vec3(0.86, 0.79, 0.66);
 uniform sampler2D band_lut : filter_linear, repeat_disable;
 // 行星半径（与环网格同一坐标系），用于计算本影
 uniform float planet_radius = 1.0;
+// 沿半径的真实色彩条（Solar System Scope 的土星环贴图，2048x125）。
+//
+// **只取颜色，不取不透明度**。环带边界与不透明度来自 internal/bodies 的
+// 实测数据（上面注释里那串 km），是这个项目的真相源；贴图的 alpha 是别人
+// 的美术再加工，两者混用等于让同一个量有两个来源。天王星/海王星没有对应
+// 贴图，use_color_tex=false 时退回单一 ring_color。
+uniform sampler2D color_tex : source_color, filter_linear;
+uniform bool use_color_tex = false;
 
 varying vec3 world_pos;
 varying vec3 local_pos;
@@ -88,7 +96,17 @@ void fragment() {
 	float sun_face = abs(dot(ring_n, L));
 	float illum = 0.42 + 2.60 * pow(sun_face, 0.55);
 
-	vec3 c = ring_color * mix(0.80, 1.15, detail) * illum;
+	vec3 rc = ring_color;
+	if (use_color_tex) {
+		// 贴图是一条横向色带，取中间一行即可；归一化半径直接当 U。
+		vec3 t = texture(color_tex, vec2(clamp(r, 0.002, 0.998), 0.5)).rgb;
+		// 除以贴图自身的 alpha 加权平均亮度（实测 0.373）再乘回 ring_color，
+		// 这样贴图只贡献色彩沿半径的**相对**变化，不改变环系整体亮度。
+		// 夹上限是因为贴图在 alpha=0 的最内/最外缘是纯白，放大 2.7 倍会
+		// 在那里爆一圈亮边（我们自己的 LUT 在那儿不透明度也近 0，但别赌）。
+		rc = ring_color * clamp(t / 0.373, vec3(0.0), vec3(2.0));
+	}
+	vec3 c = rc * mix(0.80, 1.15, detail) * illum;
 	c *= shadow;
 	c = mix(c, c * (1.0 - opacity * 0.75) * 2.2, backlit * 0.45);
 
